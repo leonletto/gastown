@@ -126,11 +126,10 @@ func startMayorSession(t *tmux.Tmux) error {
 	theme := tmux.MayorTheme()
 	_ = t.ConfigureGasTownSession(MayorSessionName, theme, "", "Mayor", "coordinator")
 
-	// Launch Claude in a respawn loop - session survives restarts
-	// The startup hook handles 'gt prime' automatically
+	// Launch Claude - the startup hook handles 'gt prime' automatically
 	// Use SendKeysDelayed to allow shell initialization after NewSession
-	loopCmd := `while true; do echo "🏛️  Starting Mayor session..."; claude --dangerously-skip-permissions; echo ""; echo "Mayor exited. Restarting in 2s... (Ctrl-C to stop)"; sleep 2; done`
-	if err := t.SendKeysDelayed(MayorSessionName, loopCmd, 200); err != nil {
+	claudeCmd := `claude --dangerously-skip-permissions`
+	if err := t.SendKeysDelayed(MayorSessionName, claudeCmd, 200); err != nil {
 		return fmt.Errorf("sending command: %w", err)
 	}
 
@@ -179,7 +178,6 @@ func runMayorAttach(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	}
-	// Session uses a respawn loop, so Claude restarts automatically if it exits
 
 	// Use exec to replace current process with tmux attach
 	tmuxPath, err := exec.LookPath("tmux")
@@ -248,13 +246,15 @@ func runMayorRestart(cmd *cobra.Command, args []string) error {
 	}
 
 	if running {
-		// Graceful restart: send Ctrl-C to exit Claude, loop will restart it
-		fmt.Println("Restarting Mayor (sending Ctrl-C to trigger respawn loop)...")
+		// Stop the current session
+		fmt.Println("Stopping Mayor session...")
 		_ = t.SendKeysRaw(MayorSessionName, "C-c")
-		fmt.Printf("%s Mayor will restart automatically. Session stays attached.\n", style.Bold.Render("✓"))
-		return nil
+		time.Sleep(100 * time.Millisecond)
+		if err := t.KillSession(MayorSessionName); err != nil {
+			return fmt.Errorf("killing session: %w", err)
+		}
 	}
 
-	// Not running, start fresh
+	// Start fresh
 	return runMayorStart(cmd, args)
 }
