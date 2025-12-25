@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -538,7 +539,7 @@ func outputAttachmentStatus(ctx RoleContext) {
 		return
 	}
 
-	// Has attached work - output prominently
+	// Has attached work - output prominently with current step
 	fmt.Println()
 	fmt.Printf("%s\n\n", style.Bold.Render("## 🎯 ATTACHED WORK DETECTED"))
 	fmt.Printf("Pinned bead: %s\n", pinnedBeads[0].ID)
@@ -547,8 +548,91 @@ func outputAttachmentStatus(ctx RoleContext) {
 		fmt.Printf("Attached at: %s\n", attachment.AttachedAt)
 	}
 	fmt.Println()
-	fmt.Println(style.Bold.Render("→ AUTO-CONTINUE MODE: Proceed with attached work immediately."))
-	fmt.Println("  No human input needed. Continue from where predecessor left off.")
+
+	// Show current step from molecule
+	showMoleculeExecutionPrompt(ctx.WorkDir, attachment.AttachedMolecule)
+}
+
+// MoleculeCurrentOutput represents the JSON output of bd mol current.
+type MoleculeCurrentOutput struct {
+	MoleculeID    string `json:"molecule_id"`
+	MoleculeTitle string `json:"molecule_title"`
+	NextStep      *struct {
+		ID          string `json:"id"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+	} `json:"next_step"`
+	Completed int `json:"completed"`
+	Total     int `json:"total"`
+}
+
+// showMoleculeExecutionPrompt calls bd mol current and shows the current step
+// with execution instructions. This is the core of the Propulsion Principle.
+func showMoleculeExecutionPrompt(workDir, moleculeID string) {
+	// Call bd mol current with JSON output
+	cmd := exec.Command("bd", "--no-daemon", "mol", "current", moleculeID, "--json")
+	cmd.Dir = workDir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		// Fall back to simple message if bd mol current fails
+		fmt.Println(style.Bold.Render("→ PROPULSION PRINCIPLE: Work is on your hook. RUN IT."))
+		fmt.Println("  Begin working on this molecule immediately.")
+		fmt.Printf("  Check status with: bd mol current %s\n", moleculeID)
+		return
+	}
+
+	// Parse JSON output - it's an array with one element
+	var outputs []MoleculeCurrentOutput
+	if err := json.Unmarshal(stdout.Bytes(), &outputs); err != nil || len(outputs) == 0 {
+		// Fall back to simple message
+		fmt.Println(style.Bold.Render("→ PROPULSION PRINCIPLE: Work is on your hook. RUN IT."))
+		fmt.Println("  Begin working on this molecule immediately.")
+		return
+	}
+	output := outputs[0]
+
+	// Show molecule progress
+	fmt.Printf("**Progress:** %d/%d steps complete\n\n",
+		output.Completed, output.Total)
+
+	// Show current step if available
+	if output.NextStep != nil {
+		step := output.NextStep
+		fmt.Printf("%s\n\n", style.Bold.Render("## 🎬 CURRENT STEP: "+step.Title))
+		fmt.Printf("**Step ID:** %s\n", step.ID)
+		fmt.Printf("**Status:** %s (ready to execute)\n\n", step.Status)
+
+		// Show step description if available
+		if step.Description != "" {
+			fmt.Println("### Instructions")
+			fmt.Println()
+			// Indent the description for readability
+			lines := strings.Split(step.Description, "\n")
+			for _, line := range lines {
+				fmt.Printf("%s\n", line)
+			}
+			fmt.Println()
+		}
+
+		// The propulsion directive
+		fmt.Println(style.Bold.Render("→ EXECUTE THIS STEP NOW."))
+		fmt.Println()
+		fmt.Println("When complete:")
+		fmt.Printf("  1. Close the step: bd close %s\n", step.ID)
+		fmt.Println("  2. Check for next step: bd ready")
+		fmt.Println("  3. Continue until molecule complete")
+	} else {
+		// No next step - molecule may be complete
+		fmt.Println(style.Bold.Render("✓ MOLECULE COMPLETE"))
+		fmt.Println()
+		fmt.Println("All steps are done. You may:")
+		fmt.Println("  - Report completion to supervisor")
+		fmt.Println("  - Check for new work: bd ready")
+	}
 }
 
 // outputMoleculeContext checks if the agent is working on a molecule step and shows progress.
