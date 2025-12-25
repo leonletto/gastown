@@ -91,6 +91,20 @@ Examples:
 	RunE: runDeaconHeartbeat,
 }
 
+var deaconTriggerPendingCmd = &cobra.Command{
+	Use:   "trigger-pending",
+	Short: "Trigger pending polecat spawns",
+	Long: `Check inbox for POLECAT_STARTED messages and trigger ready polecats.
+
+When gt spawn creates a new polecat, Claude takes 10-20 seconds to initialize.
+This command polls pending spawns and sends "Begin." when Claude is ready.
+
+This is typically called during the Deacon's patrol loop.`,
+	RunE: runDeaconTriggerPending,
+}
+
+var triggerTimeout time.Duration
+
 func init() {
 	deaconCmd.AddCommand(deaconStartCmd)
 	deaconCmd.AddCommand(deaconStopCmd)
@@ -98,6 +112,11 @@ func init() {
 	deaconCmd.AddCommand(deaconStatusCmd)
 	deaconCmd.AddCommand(deaconRestartCmd)
 	deaconCmd.AddCommand(deaconHeartbeatCmd)
+	deaconCmd.AddCommand(deaconTriggerPendingCmd)
+
+	// Flags for trigger-pending
+	deaconTriggerPendingCmd.Flags().DurationVar(&triggerTimeout, "timeout", 2*time.Second,
+		"Timeout for checking if Claude is ready")
 
 	rootCmd.AddCommand(deaconCmd)
 }
@@ -298,6 +317,62 @@ func runDeaconHeartbeat(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("updating heartbeat: %w", err)
 		}
 		fmt.Printf("%s Heartbeat updated\n", style.Bold.Render("✓"))
+	}
+
+	return nil
+}
+
+func runDeaconTriggerPending(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Step 1: Check inbox for new POLECAT_STARTED messages
+	pending, err := deacon.CheckInboxForSpawns(townRoot)
+	if err != nil {
+		return fmt.Errorf("checking inbox: %w", err)
+	}
+
+	if len(pending) == 0 {
+		fmt.Printf("%s No pending spawns\n", style.Dim.Render("○"))
+		return nil
+	}
+
+	fmt.Printf("%s Found %d pending spawn(s)\n", style.Bold.Render("●"), len(pending))
+
+	// Step 2: Try to trigger each pending spawn
+	results, err := deacon.TriggerPendingSpawns(townRoot, triggerTimeout)
+	if err != nil {
+		return fmt.Errorf("triggering: %w", err)
+	}
+
+	// Report results
+	triggered := 0
+	for _, r := range results {
+		if r.Triggered {
+			triggered++
+			fmt.Printf("  %s Triggered %s/%s\n",
+				style.Bold.Render("✓"),
+				r.Spawn.Rig, r.Spawn.Polecat)
+		} else if r.Error != nil {
+			fmt.Printf("  %s %s/%s: %v\n",
+				style.Dim.Render("⚠"),
+				r.Spawn.Rig, r.Spawn.Polecat, r.Error)
+		}
+	}
+
+	// Step 3: Prune stale pending spawns (older than 5 minutes)
+	pruned, _ := deacon.PruneStalePending(townRoot, 5*time.Minute)
+	if pruned > 0 {
+		fmt.Printf("  %s Pruned %d stale spawn(s)\n", style.Dim.Render("○"), pruned)
+	}
+
+	// Summary
+	remaining := len(pending) - triggered
+	if remaining > 0 {
+		fmt.Printf("%s %d spawn(s) still waiting for Claude\n",
+			style.Dim.Render("○"), remaining)
 	}
 
 	return nil
