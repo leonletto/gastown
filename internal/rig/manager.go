@@ -156,7 +156,6 @@ type AddRigOptions struct {
 	Name        string // Rig name (directory name)
 	GitURL      string // Repository URL
 	BeadsPrefix string // Beads issue prefix (defaults to derived from name)
-	CrewName    string // Default crew workspace name (defaults to "main")
 }
 
 // AddRig creates a new rig as a container with clones for each agent.
@@ -185,9 +184,6 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 	// Derive defaults
 	if opts.BeadsPrefix == "" {
 		opts.BeadsPrefix = deriveBeadsPrefix(opts.Name)
-	}
-	if opts.CrewName == "" {
-		opts.CrewName = "main"
 	}
 
 	// Create container directory
@@ -271,17 +267,32 @@ func (m *Manager) AddRig(opts AddRigOptions) (*Rig, error) {
 		fmt.Printf("  Warning: Could not create refinery hooks: %v\n", err)
 	}
 
-	// Clone repository for default crew workspace
-	crewPath := filepath.Join(rigPath, "crew", opts.CrewName)
-	if err := os.MkdirAll(filepath.Dir(crewPath), 0755); err != nil {
+	// Create empty crew directory with README (crew members added via gt crew add)
+	crewPath := filepath.Join(rigPath, "crew")
+	if err := os.MkdirAll(crewPath, 0755); err != nil {
 		return nil, fmt.Errorf("creating crew dir: %w", err)
 	}
-	if err := m.git.Clone(opts.GitURL, crewPath); err != nil {
-		return nil, fmt.Errorf("cloning for crew: %w", err)
-	}
-	// Create crew CLAUDE.md (overrides any from cloned repo)
-	if err := m.createRoleCLAUDEmd(crewPath, "crew", opts.Name, opts.CrewName); err != nil {
-		return nil, fmt.Errorf("creating crew CLAUDE.md: %w", err)
+	// Create README with instructions
+	readmePath := filepath.Join(crewPath, "README.md")
+	readmeContent := `# Crew Directory
+
+This directory contains crew worker workspaces.
+
+## Adding a Crew Member
+
+` + "```bash" + `
+gt crew add <name>    # Creates crew/<name>/ with a git clone
+` + "```" + `
+
+## Crew vs Polecats
+
+- **Crew**: Persistent, user-managed workspaces (never auto-garbage-collected)
+- **Polecats**: Transient, witness-managed workers (cleaned up after work completes)
+
+Use crew for your own workspace. Polecats are for batch work dispatch.
+`
+	if err := os.WriteFile(readmePath, []byte(readmeContent), 0644); err != nil {
+		return nil, fmt.Errorf("creating crew README: %w", err)
 	}
 
 	// Create witness directory (no clone needed)
