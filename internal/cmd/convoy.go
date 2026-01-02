@@ -86,7 +86,8 @@ issues across any rig.
 
 Examples:
   gt convoy create "Deploy v2.0" gt-abc bd-xyz
-  gt convoy create "Release prep" gt-abc --notify mayor/
+  gt convoy create "Release prep" gt-abc --notify           # defaults to mayor/
+  gt convoy create "Release prep" gt-abc --notify ops/      # notify ops/
   gt convoy create "Feature rollout" gt-a gt-b gt-c --molecule mol-release`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runConvoyCreate,
@@ -133,7 +134,8 @@ Examples:
 func init() {
 	// Create flags
 	convoyCreateCmd.Flags().StringVar(&convoyMolecule, "molecule", "", "Associated molecule ID")
-	convoyCreateCmd.Flags().StringVar(&convoyNotify, "notify", "", "Address to notify on completion")
+	convoyCreateCmd.Flags().StringVar(&convoyNotify, "notify", "", "Address to notify on completion (default: mayor/ if flag used without value)")
+	convoyCreateCmd.Flags().Lookup("notify").NoOptDefVal = "mayor/"
 
 	// Status flags
 	convoyStatusCmd.Flags().BoolVar(&convoyStatusJSON, "json", false, "Output as JSON")
@@ -171,13 +173,6 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 	townBeads, err := getTownBeadsDir()
 	if err != nil {
 		return err
-	}
-
-	// Default --notify to mayor/ when mayor creates a convoy
-	if convoyNotify == "" {
-		if roleInfo, err := GetRole(); err == nil && roleInfo.Role == RoleMayor {
-			convoyNotify = "mayor/"
-		}
 	}
 
 	// Create convoy issue in town beads
