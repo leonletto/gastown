@@ -519,11 +519,14 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 	// Get session from flag or try to detect from environment
 	session := recordSession
 	if session == "" {
-		// Try to get from TMUX_PANE or tmux environment
 		session = os.Getenv("GT_SESSION")
 	}
 	if session == "" {
-		return fmt.Errorf("--session flag required (or set GT_SESSION env var)")
+		// Derive session name from GT_* environment variables
+		session = deriveSessionName()
+	}
+	if session == "" {
+		return fmt.Errorf("--session flag required (or set GT_SESSION env var, or GT_RIG/GT_ROLE)")
 	}
 
 	t := tmux.NewTmux()
@@ -608,6 +611,41 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// deriveSessionName derives the tmux session name from GT_* environment variables.
+// Session naming patterns:
+//   - Polecats: gt-{rig}-{polecat} (e.g., gt-gastown-toast)
+//   - Crew: gt-{rig}-crew-{crew} (e.g., gt-gastown-crew-max)
+//   - Witness/Refinery: gt-{rig}-{role} (e.g., gt-gastown-witness)
+//   - Mayor/Deacon: gt-{role} (e.g., gt-mayor)
+func deriveSessionName() string {
+	role := os.Getenv("GT_ROLE")
+	rig := os.Getenv("GT_RIG")
+	polecat := os.Getenv("GT_POLECAT")
+	crew := os.Getenv("GT_CREW")
+
+	// Polecat: gt-{rig}-{polecat}
+	if polecat != "" && rig != "" {
+		return fmt.Sprintf("gt-%s-%s", rig, polecat)
+	}
+
+	// Crew: gt-{rig}-crew-{crew}
+	if crew != "" && rig != "" {
+		return fmt.Sprintf("gt-%s-crew-%s", rig, crew)
+	}
+
+	// Global roles without rig: gt-{role}
+	if role != "" && rig == "" {
+		return fmt.Sprintf("gt-%s", role)
+	}
+
+	// Rig-based roles (witness, refinery): gt-{rig}-{role}
+	if role != "" && rig != "" {
+		return fmt.Sprintf("gt-%s-%s", rig, role)
+	}
+
+	return ""
 }
 
 // buildAgentPath builds the agent path from role, rig, and worker.
