@@ -194,7 +194,8 @@ func (m *Manager) Start(foreground bool) error {
 	// Start Claude agent with full permissions (like polecats)
 	// NOTE: No gt prime injection needed - SessionStart hook handles it automatically
 	// Restarts are handled by daemon via LIFECYCLE mail, not shell loops
-	command := config.GetRuntimeCommand("")
+	// Export GT_ROLE and BD_ACTOR in the command since tmux SetEnvironment only affects new panes
+	command := config.BuildAgentStartupCommand("refinery", bdActor, "", "")
 	if err := t.SendKeys(sessionID, command); err != nil {
 		// Clean up the session on failure (best-effort cleanup)
 		_ = t.KillSession(sessionID)

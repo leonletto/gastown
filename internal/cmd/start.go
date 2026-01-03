@@ -947,8 +947,9 @@ func startCrewMember(rigName, crewName, townRoot string) error {
 		return fmt.Errorf("waiting for shell: %w", err)
 	}
 
-	// Start claude
-	if err := t.SendKeys(sessionID, config.GetRuntimeCommand(r.Path)); err != nil {
+	// Start claude with proper env vars for seance
+	claudeCmd := config.BuildCrewStartupCommand(rigName, crewName, r.Path, "")
+	if err := t.SendKeys(sessionID, claudeCmd); err != nil {
 		return fmt.Errorf("starting claude: %w", err)
 	}
 
