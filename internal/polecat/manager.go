@@ -252,6 +252,16 @@ func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error)
 		fmt.Printf("Warning: could not provision slash commands: %v\n", err)
 	}
 
+	// Ensure Claude settings exist (autonomous role needs mail in SessionStart)
+	if err := claude.EnsureSettingsForRole(polecatPath, "polecat"); err != nil {
+		fmt.Printf("Warning: could not provision Claude settings: %v\n", err)
+	}
+
+	// Ensure local settings with permissions (prevents permission prompts)
+	if err := claude.EnsureLocalSettings(polecatPath); err != nil {
+		fmt.Printf("Warning: could not provision Claude local settings: %v\n", err)
+	}
+
 	// Create agent bead for ZFC compliance (self-report state).
 	// State starts as "spawning" - will be updated to "working" when Claude starts.
 	// HookBead is set atomically at creation time if provided (avoids cross-beads routing issues).

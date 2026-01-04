@@ -78,3 +78,34 @@ func EnsureSettings(workDir string, roleType RoleType) error {
 func EnsureSettingsForRole(workDir, role string) error {
 	return EnsureSettings(workDir, RoleTypeFor(role))
 }
+
+// EnsureLocalSettings ensures .claude/settings.local.json exists in the given directory.
+// This file contains permissions that allow autonomous agents to work without prompts.
+// If the file already exists, it's left unchanged.
+func EnsureLocalSettings(workDir string) error {
+	claudeDir := filepath.Join(workDir, ".claude")
+	localSettingsPath := filepath.Join(claudeDir, "settings.local.json")
+
+	// If settings.local.json already exists, don't overwrite
+	if _, err := os.Stat(localSettingsPath); err == nil {
+		return nil
+	}
+
+	// Create .claude directory if needed
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		return fmt.Errorf("creating .claude directory: %w", err)
+	}
+
+	// Read template
+	content, err := configFS.ReadFile("config/settings.local.json")
+	if err != nil {
+		return fmt.Errorf("reading settings.local.json template: %w", err)
+	}
+
+	// Write settings.local.json file
+	if err := os.WriteFile(localSettingsPath, content, 0644); err != nil {
+		return fmt.Errorf("writing settings.local.json: %w", err)
+	}
+
+	return nil
+}
