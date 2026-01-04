@@ -25,17 +25,30 @@ Multi-agent orchestrator for Claude Code. Track work with convoys; sling to agen
 # Install
 go install github.com/steveyegge/gastown/cmd/gt@latest
 
-# Create workspace
-gt install ~/gt
+# Ensure Go binaries are in your PATH (add to ~/.zshrc or ~/.bashrc)
+export PATH="$PATH:$HOME/go/bin"
+
+# Create workspace (--git auto-initializes git repository)
+gt install ~/gt --git
+cd ~/gt
 
 # Add a project
 gt rig add myproject https://github.com/you/repo.git
 
-# Enter the Mayor's office (recommended)
-cd ~/gt && gt prime
+# Create your personal workspace
+gt crew add <yourname> --rig myproject
+
+# Start working
+cd myproject/crew/<yourname>
 ```
 
-Once inside the Mayor session, you're talking to Claude with full town context. Just tell it what you want:
+For advanced multi-agent coordination, use the Mayor session:
+
+```bash
+gt mayor attach                        # Enter the Mayor's office
+```
+
+Inside the Mayor session, you're talking to Claude with full town context:
 
 > "Help me fix the authentication bug in myproject"
 
@@ -78,7 +91,7 @@ The primary Gas Town experience. Agents run in tmux sessions with the Mayor as y
 
 ```bash
 gt start                               # Start Gas Town (daemon + Mayor session)
-cd ~/gt && gt prime                    # Enter Mayor session
+gt mayor attach                        # Enter Mayor session
 
 # Inside Mayor session, just ask:
 # "Create a convoy for issues 123 and 456 in myproject"
@@ -249,6 +262,33 @@ gt peek <agent>                   # Check agent health
 gt doctor                         # Health check
 gt doctor --fix                   # Auto-repair
 ```
+
+## Dashboard
+
+Web-based dashboard for monitoring Gas Town activity.
+
+```bash
+# Start the dashboard
+gt dashboard --port 8080
+
+# Open in browser
+open http://localhost:8080
+```
+
+**Features:**
+- **Convoy tracking** - View all active convoys with progress bars and work status
+- **Polecat workers** - See active worker sessions and their activity status
+- **Refinery status** - Monitor merge queue and PR processing
+- **Auto-refresh** - Updates every 10 seconds via htmx
+
+Work status indicators:
+| Status | Color | Meaning |
+|--------|-------|---------|
+| `complete` | Green | All tracked items done |
+| `active` | Green | Recent activity (< 1 min) |
+| `stale` | Yellow | Activity 1-5 min ago |
+| `stuck` | Red | Activity > 5 min ago |
+| `waiting` | Gray | No assignee/activity |
 
 ## Shell Completions
 

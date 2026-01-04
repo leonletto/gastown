@@ -115,7 +115,7 @@ func (c *PatrolMoleculesExistCheck) Fix(ctx *CheckContext) error {
 		rigPath := filepath.Join(ctx.TownRoot, rigName)
 		for _, mol := range missing {
 			desc := getPatrolMoleculeDesc(mol)
-			cmd := exec.Command("bd", "create",
+			cmd := exec.Command("bd", "create", //nolint:gosec // G204: args are constructed internally
 				"--type=molecule",
 				"--title="+mol,
 				"--description="+desc,
@@ -167,7 +167,7 @@ func (c *PatrolHooksWiredCheck) Run(ctx *CheckContext) *CheckResult {
 			Name:    c.Name(),
 			Status:  StatusWarning,
 			Message: "Daemon config not found",
-			FixHint: "Run 'gt daemon init' to configure daemon",
+			FixHint: "Run 'gt daemon start' to start the daemon",
 		}
 	}
 
@@ -220,7 +220,7 @@ func (c *PatrolHooksWiredCheck) Run(ctx *CheckContext) *CheckResult {
 		Name:    c.Name(),
 		Status:  StatusWarning,
 		Message: "Patrol hooks not configured in daemon",
-		FixHint: "Configure patrols in mayor/daemon.json or run 'gt daemon init'",
+		FixHint: "Configure patrols in mayor/daemon.json or run 'gt daemon start'",
 	}
 }
 

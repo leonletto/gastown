@@ -526,6 +526,10 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 		session = deriveSessionName()
 	}
 	if session == "" {
+		// Try to detect current tmux session (works when running inside tmux)
+		session = detectCurrentTmuxSession()
+	}
+	if session == "" {
 		return fmt.Errorf("--session flag required (or set GT_SESSION env var, or GT_RIG/GT_ROLE)")
 	}
 
@@ -618,12 +622,13 @@ func runCostsRecord(cmd *cobra.Command, args []string) error {
 //   - Polecats: gt-{rig}-{polecat} (e.g., gt-gastown-toast)
 //   - Crew: gt-{rig}-crew-{crew} (e.g., gt-gastown-crew-max)
 //   - Witness/Refinery: gt-{rig}-{role} (e.g., gt-gastown-witness)
-//   - Mayor/Deacon: gt-{role} (e.g., gt-mayor)
+//   - Mayor/Deacon: gt-{town}-{role} (e.g., gt-ai-mayor)
 func deriveSessionName() string {
 	role := os.Getenv("GT_ROLE")
 	rig := os.Getenv("GT_RIG")
 	polecat := os.Getenv("GT_POLECAT")
 	crew := os.Getenv("GT_CREW")
+	town := os.Getenv("GT_TOWN")
 
 	// Polecat: gt-{rig}-{polecat}
 	if polecat != "" && rig != "" {
@@ -635,9 +640,9 @@ func deriveSessionName() string {
 		return fmt.Sprintf("gt-%s-crew-%s", rig, crew)
 	}
 
-	// Global roles without rig: gt-{role}
-	if role != "" && rig == "" {
-		return fmt.Sprintf("gt-%s", role)
+	// Town-level roles (mayor, deacon): gt-{town}-{role}
+	if (role == "mayor" || role == "deacon") && town != "" {
+		return fmt.Sprintf("gt-%s-%s", town, role)
 	}
 
 	// Rig-based roles (witness, refinery): gt-{rig}-{role}
@@ -645,6 +650,28 @@ func deriveSessionName() string {
 		return fmt.Sprintf("gt-%s-%s", rig, role)
 	}
 
+	return ""
+}
+
+// detectCurrentTmuxSession returns the current tmux session name if running inside tmux.
+// Uses `tmux display-message -p '#S'` which prints the session name.
+func detectCurrentTmuxSession() string {
+	// Check if we're inside tmux
+	if os.Getenv("TMUX") == "" {
+		return ""
+	}
+
+	cmd := exec.Command("tmux", "display-message", "-p", "#S")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	session := strings.TrimSpace(string(output))
+	// Only return if it looks like a Gas Town session
+	if strings.HasPrefix(session, constants.SessionPrefix) {
+		return session
+	}
 	return ""
 }
 

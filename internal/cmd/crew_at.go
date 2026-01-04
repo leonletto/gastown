@@ -183,10 +183,11 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 
 	// Check if we're already in the target session
 	if isInTmuxSession(sessionID) {
-		// We're in the session at a shell prompt - just start Claude directly
-		// Pass "gt prime" as initial prompt so Claude loads context immediately
-		fmt.Printf("Starting Claude in current session...\n")
-		return execClaude("gt prime")
+		// We're in the session at a shell prompt - just start the agent directly
+		// Pass "gt prime" as initial prompt so it loads context immediately
+		agentCfg := config.ResolveAgentConfig(townRoot, r.Path)
+		fmt.Printf("Starting %s in current session...\n", agentCfg.Command)
+		return execAgent(agentCfg, "gt prime")
 	}
 
 	// If inside tmux (but different session), don't switch - just inform user
