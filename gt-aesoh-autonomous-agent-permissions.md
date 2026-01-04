@@ -36,7 +36,19 @@ Deployed 10 polecats to cleanroom rig for reconciliation work:
 
 ## Root Cause
 
-Claude Code requires explicit permissions in `.claude/settings.local.json` before allowing autonomous execution. Currently, we only provision `.claude/settings.json` (with hooks) but not `settings.local.json` (with permissions).
+Claude Code requires explicit permissions before allowing autonomous execution. There are two approaches:
+
+1. **`--dangerously-skip-permissions` flag** (current approach as of ec29ca0)
+   - Polecats launched with: `claude --dangerously-skip-permissions`
+   - Bypasses all permission prompts
+   - Shows one-time warning dialog that must be accepted
+   - Auto-accept attempted in 94857fc but still requires manual intervention
+
+2. **`.claude/settings.local.json` permissions** (alternative approach)
+   - Granular control over specific permissions
+   - No warning dialog
+   - More secure but requires comprehensive permission list
+   - Currently we only provision `.claude/settings.json` (with hooks) but not `settings.local.json`
 
 ## Proposed Solution
 
@@ -159,14 +171,34 @@ Collected from 10 polecats completing reconciliation tasks (2026-01-03 16:25-17:
 
 **Key Finding:** Polecats that completed full workflow (commit → push → gt done) accumulated 11-14 permissions. The comprehensive set above (14 permissions) represents the union of all observed needs.
 
+## Current State (2026-01-03)
+
+New polecats are launched with `--dangerously-skip-permissions` flag but still hit the warning dialog:
+```
+WARNING: Claude Code running in Bypass Permissions mode
+...
+1. No, exit
+2. Yes, I accept
+```
+
+The auto-accept fix (commit 94857fc) is not working, requiring manual intervention for each new polecat.
+
 ## Next Steps
 
+**Option A: Fix the auto-accept for `--dangerously-skip-permissions`**
+1. Investigate why 94857fc auto-accept isn't working
+2. Fix the warning dialog auto-acceptance
+3. Simpler but less secure (bypasses all permissions)
+
+**Option B: Switch to `settings.local.json` approach**
 1. Review existing provisioning code in `internal/polecat/manager.go`
 2. Check `internal/claude/settings.go` for settings template patterns
 3. Implement `settings.local.json` provisioning with comprehensive permission set
-4. Test with new polecat creation
-5. Document migration path for existing agents
-6. Consider: Should we use comprehensive set or wildcard permissions?
+4. Remove `--dangerously-skip-permissions` flag from polecat launch
+5. Test with new polecat creation
+6. More secure with granular permissions
+
+**Recommendation:** Option B provides better security and aligns with Claude Code's permission model.
 
 ---
 
