@@ -1,8 +1,32 @@
 # Gas Town LLM Onboarding Guide
 
-**For:** New LLM agents working with Gas Town  
-**Based on:** Cleanroom reconciliation project (2026-01-03)  
+**For:** New LLM agents working with Gas Town
+**Based on:** Cleanroom reconciliation project (2026-01-03)
 **Experience:** Managing 10+ polecats, full workflow from sling → merge
+
+---
+
+## ⚠️ CRITICAL: Working Directory
+
+**ALWAYS work from the Gas Town installation directory, NOT the source code repository!**
+
+```bash
+# ✅ CORRECT - Gas Town installation (where rigs live)
+cd /Users/leon/gt
+
+# ❌ WRONG - Source code repository (for development only)
+cd /Users/Shared/Falcon/gastown
+```
+
+**Before running ANY `gt` commands:**
+1. Check your current directory: `pwd`
+2. If not in `/Users/leon/gt`, change to it: `cd /Users/leon/gt`
+3. Verify you see rigs: `ls -la` should show `cleanroom/`, `mayor/`, `deacon/`, etc.
+
+**Why this matters:**
+- All `gt` commands expect to run from the town root
+- Polecats, witness, refinery are all relative to the town root
+- Running from the wrong directory will fail silently or create confusion
 
 ---
 
@@ -66,8 +90,26 @@ gt polecat sync <rig> --all              # Sync all polecats
 ```
 
 #### Session Management
+
+**⚠️ CRITICAL: Mail Does NOT Start Sessions!**
+
+Sending mail to a polecat (e.g., `gt mail send cleanroom/polecat/nux -s "start"`) does **NOT** create or start a tmux session. Mail is for communication between **already running** agents.
+
+**To actually start a polecat session:**
+
 ```bash
-# Start/stop sessions
+# ✅ CORRECT - Start a polecat session (creates tmux session + launches Claude)
+gt session start <rig>/<polecat>         # Start polecat session
+
+# ✅ CORRECT - Sling work (spawns polecat + starts session automatically)
+gt sling <issue-id> <rig>                # Creates polecat, starts session, assigns work
+
+# ❌ WRONG - This only creates a mail message, doesn't start anything
+gt mail send <rig>/polecat/<name> -s "start" -m "start"
+```
+
+**Session control commands:**
+```bash
 gt session start <rig>/<polecat>         # Start polecat session
 gt session stop <rig>/<polecat>          # Stop session gracefully
 gt session stop <rig>/<polecat> --force  # Force stop
@@ -165,6 +207,44 @@ bd dep list <issue-id>                   # Show dependencies
 ## 🔧 Troubleshooting Guide
 
 ### Common Failure Patterns
+
+#### 0. No Tmux Sessions Exist (Polecats Not Actually Started)
+
+**Symptoms:**
+- `tmux list-sessions` shows: `error connecting to /private/tmp/tmux-501/default (No such file or directory)`
+- `gt polecat list <rig>` shows polecats as "idle"
+- Mayor or other agent says they "started" polecats but nothing happened
+
+**Diagnosis:**
+```bash
+cd /Users/leon/gt                        # CRITICAL: Be in town root!
+tmux list-sessions                       # Check if ANY sessions exist
+gt polecat list cleanroom                # Check polecat state
+```
+
+**Root Cause:**
+Mail messages don't start sessions! Sending `gt mail send cleanroom/polecat/nux -s "start"` only creates a mail bead - it doesn't launch Claude or create a tmux session.
+
+**Solution:**
+```bash
+cd /Users/leon/gt                        # CRITICAL: Be in town root!
+
+# Start individual polecats:
+gt session start cleanroom/nux
+gt session start cleanroom/keeper
+gt session start cleanroom/capable
+
+# Verify sessions are running:
+tmux list-sessions                       # Should show gt-cleanroom-nux, etc.
+
+# Or use sling to spawn + start + assign work in one command:
+gt sling <issue-id> cleanroom            # Spawns polecat, starts session, assigns work
+```
+
+**Prevention:**
+- Always use `gt session start` or `gt sling` to start polecats
+- Never rely on mail messages to start sessions
+- Verify with `tmux list-sessions` after starting
 
 #### 1. Stuck Polecat at Permission Prompt
 
@@ -521,11 +601,20 @@ bd list --status=in_progress --priority=1  # Combine filters
 ## 🎯 Quick Reference Card
 
 ```bash
+# ⚠️ FIRST: Always be in the town root!
+cd /Users/leon/gt                        # CRITICAL: Run this first!
+
 # Status Check
 gt status                                # Town overview
 gt polecat list <rig>                    # All polecats
 gt polecat status <rig>/<polecat>        # Specific polecat
 bd ready                                 # Available work
+tmux list-sessions                       # Check running sessions
+
+# Starting Polecats (IMPORTANT!)
+gt session start <rig>/<polecat>         # Start a polecat session
+gt sling <issue-id> <rig>                # Spawn + start + assign work
+# NOTE: Mail does NOT start sessions!
 
 # Work Assignment
 gt sling <issue-id> <rig>                # Assign to polecat

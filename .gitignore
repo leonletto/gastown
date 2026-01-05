@@ -6,6 +6,8 @@
 /dist/
 /build/
 
+output/
+
 # IDE
 .idea/
 .vscode/
