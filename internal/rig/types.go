@@ -16,6 +16,9 @@ type Rig struct {
 	// GitURL is the remote repository URL.
 	GitURL string `json:"git_url"`
 
+	// LocalRepo is an optional local repository used for reference clones.
+	LocalRepo string `json:"local_repo,omitempty"`
+
 	// Config is the rig-level configuration.
 	Config *config.BeadsConfig `json:"config,omitempty"`
 
@@ -67,12 +70,25 @@ func (r *Rig) Summary() RigSummary {
 }
 
 // BeadsPath returns the path to use for beads operations.
-// Returns the mayor/rig clone path if available (has proper sync-branch config),
-// otherwise falls back to the rig root path.
-// This ensures beads commands read from a location with git-synced beads data.
+// Always returns the rig root path where .beads/ contains either:
+//   - A local beads database (when repo doesn't track .beads/)
+//   - A redirect file pointing to mayor/rig/.beads (when repo tracks .beads/)
+//
+// The redirect is set up by initBeads() during rig creation and followed
+// automatically by the bd CLI and beads.ResolveBeadsDir().
+//
+// This ensures we never write to the user's repo clone (mayor/rig/) and
+// all beads operations go through the redirect system.
 func (r *Rig) BeadsPath() string {
-	if r.HasMayor {
-		return r.Path + "/mayor/rig"
-	}
 	return r.Path
+}
+
+// DefaultBranch returns the configured default branch for this rig.
+// Falls back to "main" if not configured or if config cannot be loaded.
+func (r *Rig) DefaultBranch() string {
+	cfg, err := LoadRigConfig(r.Path)
+	if err != nil || cfg.DefaultBranch == "" {
+		return "main"
+	}
+	return cfg.DefaultBranch
 }

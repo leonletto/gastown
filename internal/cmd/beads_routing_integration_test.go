@@ -6,10 +6,10 @@
 package cmd
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
@@ -104,6 +104,58 @@ func setupRoutingTestTown(t *testing.T) string {
 	return townRoot
 }
 
+func initBeadsDBWithPrefix(t *testing.T, dir, prefix string) {
+	t.Helper()
+
+	cmd := exec.Command("bd", "--no-daemon", "init", "--quiet", "--prefix", prefix)
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd init failed in %s: %v\n%s", dir, err, output)
+	}
+
+	// Create empty issues.jsonl to prevent bd auto-export from corrupting routes.jsonl.
+	// Without this, bd create writes issue data to routes.jsonl (the first .jsonl file
+	// it finds), corrupting the routing configuration. This mirrors what gt install does.
+	issuesPath := filepath.Join(dir, ".beads", "issues.jsonl")
+	if err := os.WriteFile(issuesPath, []byte(""), 0644); err != nil {
+		t.Fatalf("create issues.jsonl in %s: %v", dir, err)
+	}
+}
+
+func createTestIssue(t *testing.T, dir, title string) *beads.Issue {
+	t.Helper()
+
+	args := []string{"--no-daemon", "create", "--json", "--title", title, "--type", "task",
+		"--description", "Integration test issue"}
+	cmd := exec.Command("bd", args...)
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		combinedCmd := exec.Command("bd", args...)
+		combinedCmd.Dir = dir
+		combinedOutput, _ := combinedCmd.CombinedOutput()
+		t.Fatalf("create issue in %s: %v\n%s", dir, err, combinedOutput)
+	}
+
+	var issue beads.Issue
+	if err := json.Unmarshal(output, &issue); err != nil {
+		t.Fatalf("parse create output in %s: %v", dir, err)
+	}
+	if issue.ID == "" {
+		t.Fatalf("create issue in %s returned empty ID", dir)
+	}
+	return &issue
+}
+
+func hasIssueID(issues []*beads.Issue, id string) bool {
+	for _, issue := range issues {
+		if issue.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // TestBeadsRoutingFromTownRoot verifies that bd show routes to correct rig
 // based on issue ID prefix when run from town root.
 func TestBeadsRoutingFromTownRoot(t *testing.T) {
@@ -114,37 +166,38 @@ func TestBeadsRoutingFromTownRoot(t *testing.T) {
 
 	townRoot := setupRoutingTestTown(t)
 
+	initBeadsDBWithPrefix(t, townRoot, "hq")
+
+	gastownRigPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	testrigRigPath := filepath.Join(townRoot, "testrig", "mayor", "rig")
+	initBeadsDBWithPrefix(t, gastownRigPath, "gt")
+	initBeadsDBWithPrefix(t, testrigRigPath, "tr")
+
+	townIssue := createTestIssue(t, townRoot, "Town-level routing test")
+	gastownIssue := createTestIssue(t, gastownRigPath, "Gastown routing test")
+	testrigIssue := createTestIssue(t, testrigRigPath, "Testrig routing test")
+
 	tests := []struct {
-		prefix      string
-		expectedRig string // Expected rig path fragment in error/output
+		id    string
+		title string
 	}{
-		{"hq-", "."}, // Town-level beads
-		{"gt-", "gastown"},
-		{"tr-", "testrig"},
+		{townIssue.ID, townIssue.Title},
+		{gastownIssue.ID, gastownIssue.Title},
+		{testrigIssue.ID, testrigIssue.Title},
 	}
 
+	townBeads := beads.New(townRoot)
 	for _, tc := range tests {
-		t.Run(tc.prefix, func(t *testing.T) {
-			// Create a fake issue ID with the prefix
-			issueID := tc.prefix + "test123"
-
-			// Run bd show - it will fail since issue doesn't exist,
-			// but we're testing routing, not the issue itself
-			cmd := exec.Command("bd", "--no-daemon", "show", issueID)
-			cmd.Dir = townRoot
-			cmd.Env = append(os.Environ(), "BD_DEBUG_ROUTING=1")
-			output, _ := cmd.CombinedOutput()
-
-			// The debug routing output or error message should indicate
-			// which beads directory was used
-			outputStr := string(output)
-			t.Logf("Output for %s: %s", issueID, outputStr)
-
-			// We expect either the routing debug output or an error from the correct beads
-			// If routing works, the error will be about not finding the issue,
-			// not about routing failure
-			if strings.Contains(outputStr, "no matching route") {
-				t.Errorf("routing failed for prefix %s: %s", tc.prefix, outputStr)
+		t.Run(tc.id, func(t *testing.T) {
+			issue, err := townBeads.Show(tc.id)
+			if err != nil {
+				t.Fatalf("bd show %s failed: %v", tc.id, err)
+			}
+			if issue.ID != tc.id {
+				t.Errorf("issue.ID = %s, want %s", issue.ID, tc.id)
+			}
+			if issue.Title != tc.title {
+				t.Errorf("issue.Title = %q, want %q", issue.Title, tc.title)
 			}
 		})
 	}
@@ -263,30 +316,21 @@ func TestBeadsListFromPolecatDirectory(t *testing.T) {
 	townRoot := setupRoutingTestTown(t)
 	polecatDir := filepath.Join(townRoot, "gastown", "polecats", "rictus")
 
-	// Initialize beads in mayor/rig so bd list can work
-	mayorRigBeads := filepath.Join(townRoot, "gastown", "mayor", "rig", ".beads")
+	rigPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	initBeadsDBWithPrefix(t, rigPath, "gt")
 
-	// Create a minimal beads.db (or use bd init)
-	// For now, just test that the redirect is followed
-	cmd := exec.Command("bd", "--no-daemon", "list")
-	cmd.Dir = polecatDir
-	output, err := cmd.CombinedOutput()
+	issue := createTestIssue(t, rigPath, "Polecat list redirect test")
 
-	// We expect either success (empty list) or an error about missing db,
-	// but NOT an error about missing .beads directory (since redirect should work)
-	outputStr := string(output)
-	t.Logf("bd list output: %s", outputStr)
-
+	issues, err := beads.New(polecatDir).List(beads.ListOptions{
+		Status:   "open",
+		Priority: -1,
+	})
 	if err != nil {
-		// Check it's not a "no .beads directory" error
-		if strings.Contains(outputStr, "no .beads directory") {
-			t.Errorf("redirect not followed: %s", outputStr)
-		}
-		// Check it's finding the right beads directory via redirect
-		if strings.Contains(outputStr, "redirect") && !strings.Contains(outputStr, mayorRigBeads) {
-			// This is okay - the redirect is being processed
-			t.Logf("redirect detected in output (expected)")
-		}
+		t.Fatalf("bd list from polecat dir failed: %v", err)
+	}
+
+	if !hasIssueID(issues, issue.ID) {
+		t.Errorf("bd list from polecat dir missing issue %s", issue.ID)
 	}
 }
 
@@ -300,18 +344,20 @@ func TestBeadsListFromCrewDirectory(t *testing.T) {
 	townRoot := setupRoutingTestTown(t)
 	crewDir := filepath.Join(townRoot, "gastown", "crew", "max")
 
-	cmd := exec.Command("bd", "--no-daemon", "list")
-	cmd.Dir = crewDir
-	output, err := cmd.CombinedOutput()
+	rigPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	initBeadsDBWithPrefix(t, rigPath, "gt")
 
-	outputStr := string(output)
-	t.Logf("bd list output from crew: %s", outputStr)
+	issue := createTestIssue(t, rigPath, "Crew list redirect test")
 
+	issues, err := beads.New(crewDir).List(beads.ListOptions{
+		Status:   "open",
+		Priority: -1,
+	})
 	if err != nil {
-		// Check it's not a "no .beads directory" error
-		if strings.Contains(outputStr, "no .beads directory") {
-			t.Errorf("redirect not followed for crew: %s", outputStr)
-		}
+		t.Fatalf("bd list from crew dir failed: %v", err)
+	}
+	if !hasIssueID(issues, issue.ID) {
+		t.Errorf("bd list from crew dir missing issue %s", issue.ID)
 	}
 }
 
@@ -440,6 +486,73 @@ func TestBeadsRemoveRoute(t *testing.T) {
 	}
 	if remaining[0].Prefix != "bd-" {
 		t.Errorf("wrong route remaining: %s", remaining[0].Prefix)
+	}
+}
+
+// TestSlingCrossRigRoutingResolution verifies that sling can resolve rig paths
+// for cross-rig bead hooking using ExtractPrefix and GetRigPathForPrefix.
+// This is the fix for https://github.com/steveyegge/gastown/issues/148
+func TestSlingCrossRigRoutingResolution(t *testing.T) {
+	townRoot := setupRoutingTestTown(t)
+
+	tests := []struct {
+		beadID       string
+		expectedPath string // Relative to townRoot, or "." for town-level
+	}{
+		{"gt-mol-abc", "gastown/mayor/rig"},
+		{"tr-task-xyz", "testrig/mayor/rig"},
+		{"hq-cv-123", "."}, // Town-level beads
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.beadID, func(t *testing.T) {
+			// Step 1: Extract prefix from bead ID
+			prefix := beads.ExtractPrefix(tc.beadID)
+			if prefix == "" {
+				t.Fatalf("ExtractPrefix(%q) returned empty", tc.beadID)
+			}
+
+			// Step 2: Resolve rig path from prefix
+			rigPath := beads.GetRigPathForPrefix(townRoot, prefix)
+			if rigPath == "" {
+				t.Fatalf("GetRigPathForPrefix(%q, %q) returned empty", townRoot, prefix)
+			}
+
+			// Step 3: Verify the path is correct
+			var expectedFull string
+			if tc.expectedPath == "." {
+				expectedFull = townRoot
+			} else {
+				expectedFull = filepath.Join(townRoot, tc.expectedPath)
+			}
+
+			if rigPath != expectedFull {
+				t.Errorf("GetRigPathForPrefix resolved to %q, want %q", rigPath, expectedFull)
+			}
+
+			// Step 4: Verify the .beads directory exists at that path
+			beadsDir := filepath.Join(rigPath, ".beads")
+			if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+				t.Errorf(".beads directory doesn't exist at resolved path: %s", beadsDir)
+			}
+		})
+	}
+}
+
+// TestSlingCrossRigUnknownPrefix verifies behavior for unknown prefixes.
+func TestSlingCrossRigUnknownPrefix(t *testing.T) {
+	townRoot := setupRoutingTestTown(t)
+
+	// An unknown prefix should return empty string
+	unknownBeadID := "xx-unknown-123"
+	prefix := beads.ExtractPrefix(unknownBeadID)
+	if prefix != "xx-" {
+		t.Fatalf("ExtractPrefix(%q) = %q, want %q", unknownBeadID, prefix, "xx-")
+	}
+
+	rigPath := beads.GetRigPathForPrefix(townRoot, prefix)
+	if rigPath != "" {
+		t.Errorf("GetRigPathForPrefix for unknown prefix returned %q, want empty", rigPath)
 	}
 }
 

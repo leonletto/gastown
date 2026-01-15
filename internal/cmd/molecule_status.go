@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
@@ -18,38 +19,45 @@ import (
 
 // buildAgentBeadID constructs the agent bead ID from an agent identity.
 // Uses canonical naming: prefix-rig-role-name
+// Town-level agents use hq- prefix; rig-level agents use rig's prefix.
 // Examples:
-//   - "mayor" -> "gt-mayor"
-//   - "deacon" -> "gt-deacon"
+//   - "mayor" -> "hq-mayor"
+//   - "deacon" -> "hq-deacon"
 //   - "gastown/witness" -> "gt-gastown-witness"
 //   - "gastown/refinery" -> "gt-gastown-refinery"
 //   - "gastown/nux" (polecat) -> "gt-gastown-polecat-nux"
 //   - "gastown/crew/max" -> "gt-gastown-crew-max"
 //
 // If role is unknown, it tries to infer from the identity string.
-func buildAgentBeadID(identity string, role Role) string {
+// townRoot is needed to look up the rig's configured prefix.
+func buildAgentBeadID(identity string, role Role, townRoot string) string {
 	parts := strings.Split(identity, "/")
+
+	// Helper to get prefix for a rig
+	getPrefix := func(rig string) string {
+		return config.GetRigPrefix(townRoot, rig)
+	}
 
 	// If role is unknown or empty, try to infer from identity
 	if role == RoleUnknown || role == Role("") {
 		switch {
 		case identity == "mayor":
-			return beads.MayorBeadID()
+			return beads.MayorBeadIDTown()
 		case identity == "deacon":
-			return beads.DeaconBeadID()
+			return beads.DeaconBeadIDTown()
 		case len(parts) == 2 && parts[1] == "witness":
-			return beads.WitnessBeadID(parts[0])
+			return beads.WitnessBeadIDWithPrefix(getPrefix(parts[0]), parts[0])
 		case len(parts) == 2 && parts[1] == "refinery":
-			return beads.RefineryBeadID(parts[0])
+			return beads.RefineryBeadIDWithPrefix(getPrefix(parts[0]), parts[0])
 		case len(parts) == 2:
 			// Assume rig/name is a polecat
-			return beads.PolecatBeadID(parts[0], parts[1])
+			return beads.PolecatBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[1])
 		case len(parts) == 3 && parts[1] == "crew":
 			// rig/crew/name - crew member
-			return beads.CrewBeadID(parts[0], parts[2])
+			return beads.CrewBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[2])
 		case len(parts) == 3 && parts[1] == "polecats":
 			// rig/polecats/name - explicit polecat
-			return beads.PolecatBeadID(parts[0], parts[2])
+			return beads.PolecatBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[2])
 		default:
 			return ""
 		}
@@ -57,31 +65,31 @@ func buildAgentBeadID(identity string, role Role) string {
 
 	switch role {
 	case RoleMayor:
-		return beads.MayorBeadID()
+		return beads.MayorBeadIDTown()
 	case RoleDeacon:
-		return beads.DeaconBeadID()
+		return beads.DeaconBeadIDTown()
 	case RoleWitness:
 		if len(parts) >= 1 {
-			return beads.WitnessBeadID(parts[0])
+			return beads.WitnessBeadIDWithPrefix(getPrefix(parts[0]), parts[0])
 		}
 		return ""
 	case RoleRefinery:
 		if len(parts) >= 1 {
-			return beads.RefineryBeadID(parts[0])
+			return beads.RefineryBeadIDWithPrefix(getPrefix(parts[0]), parts[0])
 		}
 		return ""
 	case RolePolecat:
 		// Handle both 2-part (rig/name) and 3-part (rig/polecats/name) formats
 		if len(parts) == 3 && parts[1] == "polecats" {
-			return beads.PolecatBeadID(parts[0], parts[2])
+			return beads.PolecatBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[2])
 		}
 		if len(parts) >= 2 {
-			return beads.PolecatBeadID(parts[0], parts[1])
+			return beads.PolecatBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[1])
 		}
 		return ""
 	case RoleCrew:
 		if len(parts) >= 3 && parts[1] == "crew" {
-			return beads.CrewBeadID(parts[0], parts[2])
+			return beads.CrewBeadIDWithPrefix(getPrefix(parts[0]), parts[0], parts[2])
 		}
 		return ""
 	default:
@@ -317,7 +325,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 
 	// Try to find agent bead and read hook slot
 	// This is the preferred method - agent beads have a hook_bead field
-	agentBeadID := buildAgentBeadID(target, roleCtx.Role)
+	agentBeadID := buildAgentBeadID(target, roleCtx.Role, townRoot)
 	var hookBead *beads.Issue
 
 	if agentBeadID != "" {
@@ -367,6 +375,7 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		// FALLBACK: Query for hooked beads (work on agent's hook)
+		// First try status=hooked (work that's been slung but not yet claimed)
 		hookedBeads, err := b.List(beads.ListOptions{
 			Status:   beads.StatusHooked,
 			Assignee: target,
@@ -374,6 +383,21 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		})
 		if err != nil {
 			return fmt.Errorf("listing hooked beads: %w", err)
+		}
+
+		// If no hooked beads found, also check in_progress beads assigned to this agent.
+		// This handles the case where work was claimed (status changed to in_progress)
+		// but the session was interrupted before completion. The hook should persist.
+		if len(hookedBeads) == 0 {
+			inProgressBeads, err := b.List(beads.ListOptions{
+				Status:   "in_progress",
+				Assignee: target,
+				Priority: -1,
+			})
+			if err == nil && len(inProgressBeads) > 0 {
+				// Use the first in_progress bead (should typically be only one)
+				hookedBeads = inProgressBeads
+			}
 		}
 
 		// For town-level roles (mayor, deacon), scan all rigs if nothing found locally
@@ -427,13 +451,14 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 }
 
 // buildAgentIdentity constructs the agent identity string from role context.
-// Format matches session.AgentIdentity.Address() for consistency.
+// Town-level agents (mayor, deacon) use trailing slash to match the format
+// used when setting assignee on hooked beads (see resolveSelfTarget in sling.go).
 func buildAgentIdentity(ctx RoleContext) string {
 	switch ctx.Role {
 	case RoleMayor:
-		return "mayor"
+		return "mayor/"
 	case RoleDeacon:
-		return "deacon"
+		return "deacon/"
 	case RoleWitness:
 		return ctx.Rig + "/witness"
 	case RoleRefinery:
@@ -577,6 +602,14 @@ func outputMoleculeStatus(status MoleculeStatusInfo) error {
 	// AUTONOMOUS MODE banner - hooked work triggers autonomous execution
 	fmt.Println(style.Bold.Render("🚀 AUTONOMOUS MODE - Work on hook triggers immediate execution"))
 	fmt.Println()
+
+	// Check if the hooked bead is already closed (someone closed it externally)
+	if status.PinnedBead.Status == "closed" {
+		fmt.Printf("%s Hooked bead %s is already closed!\n", style.Bold.Render("⚠"), status.PinnedBead.ID)
+		fmt.Printf("   Title: %s\n", status.PinnedBead.Title)
+		fmt.Printf("   This work was completed elsewhere. Clear your hook with: gt unsling\n")
+		return nil
+	}
 
 	// Check if this is a mail bead - display mail-specific format
 	if status.PinnedBead.Type == "message" {
@@ -852,8 +885,10 @@ func getGitRootForMolStatus() (string, error) {
 // isTownLevelRole returns true if the agent ID is a town-level role.
 // Town-level roles (Mayor, Deacon) operate from the town root and may have
 // pinned beads in any rig's beads directory.
+// Accepts both "mayor" and "mayor/" formats for compatibility.
 func isTownLevelRole(agentID string) bool {
-	return agentID == "mayor" || agentID == "deacon"
+	return agentID == "mayor" || agentID == "mayor/" ||
+		agentID == "deacon" || agentID == "deacon/"
 }
 
 // extractMailSender extracts the sender from mail bead labels.
@@ -886,6 +921,8 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 		}
 
 		b := beads.New(rigBeadsDir)
+
+		// First check for hooked beads
 		hookedBeads, err := b.List(beads.ListOptions{
 			Status:   beads.StatusHooked,
 			Assignee: target,
@@ -897,6 +934,20 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 
 		if len(hookedBeads) > 0 {
 			return hookedBeads
+		}
+
+		// Also check for in_progress beads (work that was claimed but session interrupted)
+		inProgressBeads, err := b.List(beads.ListOptions{
+			Status:   "in_progress",
+			Assignee: target,
+			Priority: -1,
+		})
+		if err != nil {
+			continue
+		}
+
+		if len(inProgressBeads) > 0 {
+			return inProgressBeads
 		}
 	}
 

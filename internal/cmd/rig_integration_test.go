@@ -30,9 +30,10 @@ func createTestGitRepo(t *testing.T, name string) string {
 		t.Fatalf("mkdir repo: %v", err)
 	}
 
-	// Initialize git repo
+	// Initialize git repo with explicit main branch
+	// (system default may vary, causing checkout failures)
 	cmds := [][]string{
-		{"git", "init"},
+		{"git", "init", "--initial-branch=main"},
 		{"git", "config", "user.email", "test@test.com"},
 		{"git", "config", "user.name", "Test User"},
 	}
@@ -253,6 +254,40 @@ func TestRigAddCreatesCorrectStructure(t *testing.T) {
 	} else if info.IsDir() {
 		t.Errorf("refinery/rig/.git should be a file (worktree), not a directory")
 	}
+
+	// Verify Claude settings are created in correct locations (outside git repos).
+	// Settings in parent directories are inherited by agents via directory traversal,
+	// without polluting the source repos.
+	expectedSettings := []struct {
+		path string
+		desc string
+	}{
+		{filepath.Join(rigPath, "witness", ".claude", "settings.json"), "witness/.claude/settings.json"},
+		{filepath.Join(rigPath, "refinery", ".claude", "settings.json"), "refinery/.claude/settings.json"},
+		{filepath.Join(rigPath, "crew", ".claude", "settings.json"), "crew/.claude/settings.json"},
+		{filepath.Join(rigPath, "polecats", ".claude", "settings.json"), "polecats/.claude/settings.json"},
+	}
+
+	for _, s := range expectedSettings {
+		if _, err := os.Stat(s.path); err != nil {
+			t.Errorf("%s not found: %v", s.desc, err)
+		}
+	}
+
+	// Verify settings are NOT created inside source repos (these would be wrong)
+	wrongLocations := []struct {
+		path string
+		desc string
+	}{
+		{filepath.Join(rigPath, "witness", "rig", ".claude", "settings.json"), "witness/rig/.claude (inside source repo)"},
+		{filepath.Join(rigPath, "refinery", "rig", ".claude", "settings.json"), "refinery/rig/.claude (inside source repo)"},
+	}
+
+	for _, w := range wrongLocations {
+		if _, err := os.Stat(w.path); err == nil {
+			t.Errorf("%s should NOT exist (settings would pollute source repo)", w.desc)
+		}
+	}
 }
 
 // TestRigAddInitializesBeads verifies that beads is initialized with
@@ -305,6 +340,49 @@ func TestRigAddInitializesBeads(t *testing.T) {
 		} else if !strings.Contains(string(content), "prefix: bt") && !strings.Contains(string(content), "prefix:bt") {
 			t.Errorf("config.yaml doesn't contain expected prefix, got: %s", string(content))
 		}
+	}
+
+	// =========================================================================
+	// IMPORTANT: Verify routes.jsonl does NOT exist in the rig's .beads directory
+	// =========================================================================
+	//
+	// WHY WE DON'T CREATE routes.jsonl IN RIG DIRECTORIES:
+	//
+	// 1. BD'S WALK-UP ROUTING MECHANISM:
+	//    When bd needs to find routing configuration, it walks up the directory
+	//    tree looking for a .beads directory with routes.jsonl. It stops at the
+	//    first routes.jsonl it finds. If a rig has its own routes.jsonl, bd will
+	//    use that and NEVER reach the town-level routes.jsonl, breaking cross-rig
+	//    routing entirely.
+	//
+	// 2. TOWN-LEVEL ROUTING IS THE SOURCE OF TRUTH:
+	//    All routing configuration belongs in the town's .beads/routes.jsonl.
+	//    This single file contains prefix->path mappings for ALL rigs, enabling
+	//    bd to route issue IDs like "tr-123" to the correct rig directory.
+	//
+	// 3. HISTORICAL BUG - BD AUTO-EXPORT CORRUPTION:
+	//    There was a bug where bd's auto-export feature would write issue data
+	//    to routes.jsonl if issues.jsonl didn't exist. This corrupted routing
+	//    config with issue JSON objects. We now create empty issues.jsonl files
+	//    proactively to prevent this, but we also verify routes.jsonl doesn't
+	//    exist as a defense-in-depth measure.
+	//
+	// 4. DOCTOR CHECK EXISTS:
+	//    The "rig-routes-jsonl" doctor check detects and can fix (delete) any
+	//    routes.jsonl files that appear in rig .beads directories.
+	//
+	// If you're modifying rig creation and thinking about adding routes.jsonl
+	// to the rig's .beads directory - DON'T. It will break cross-rig routing.
+	// =========================================================================
+	rigRoutesPath := filepath.Join(beadsDir, "routes.jsonl")
+	if _, err := os.Stat(rigRoutesPath); err == nil {
+		t.Errorf("routes.jsonl should NOT exist in rig .beads directory (breaks bd walk-up routing)")
+	}
+
+	// Verify issues.jsonl DOES exist (prevents bd auto-export corruption)
+	rigIssuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	if _, err := os.Stat(rigIssuesPath); err != nil {
+		t.Errorf("issues.jsonl should exist in rig .beads directory (prevents auto-export corruption): %v", err)
 	}
 }
 
@@ -542,17 +620,20 @@ func TestRigAddCreatesAgentDirs(t *testing.T) {
 
 	rigPath := filepath.Join(townRoot, "agenttest")
 
-	// Verify agent state files exist
-	expectedStateFiles := []string{
-		"witness/state.json",
-		"refinery/state.json",
-		"mayor/state.json",
+	// Verify agent directories exist (state.json files are no longer created)
+	expectedDirs := []string{
+		"witness",
+		"refinery",
+		"mayor",
 	}
 
-	for _, stateFile := range expectedStateFiles {
-		path := filepath.Join(rigPath, stateFile)
-		if _, err := os.Stat(path); err != nil {
-			t.Errorf("expected state file %s to exist: %v", stateFile, err)
+	for _, dir := range expectedDirs {
+		path := filepath.Join(rigPath, dir)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("expected directory %s to exist: %v", dir, err)
+		} else if !info.IsDir() {
+			t.Errorf("expected %s to be a directory", dir)
 		}
 	}
 }

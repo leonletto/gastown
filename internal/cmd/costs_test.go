@@ -49,11 +49,27 @@ func TestDeriveSessionName(t *testing.T) {
 			name: "mayor session",
 			envVars: map[string]string{
 				"GT_ROLE": "mayor",
+				"GT_TOWN": "ai",
+			},
+			expected: "gt-ai-mayor",
+		},
+		{
+			name: "deacon session",
+			envVars: map[string]string{
+				"GT_ROLE": "deacon",
+				"GT_TOWN": "ai",
+			},
+			expected: "gt-ai-deacon",
+		},
+		{
+			name: "mayor session without GT_TOWN",
+			envVars: map[string]string{
+				"GT_ROLE": "mayor",
 			},
 			expected: "gt-mayor",
 		},
 		{
-			name: "deacon session",
+			name: "deacon session without GT_TOWN",
 			envVars: map[string]string{
 				"GT_ROLE": "deacon",
 			},
@@ -70,7 +86,7 @@ func TestDeriveSessionName(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Save and clear relevant env vars
 			saved := make(map[string]string)
-			envKeys := []string{"GT_ROLE", "GT_RIG", "GT_POLECAT", "GT_CREW"}
+			envKeys := []string{"GT_ROLE", "GT_RIG", "GT_POLECAT", "GT_CREW", "GT_TOWN"}
 			for _, key := range envKeys {
 				saved[key] = os.Getenv(key)
 				os.Unsetenv(key)

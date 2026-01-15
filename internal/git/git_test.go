@@ -41,6 +41,53 @@ func initTestRepo(t *testing.T) string {
 	return dir
 }
 
+func TestIsRepo(t *testing.T) {
+	dir := t.TempDir()
+	g := NewGit(dir)
+
+	if g.IsRepo() {
+		t.Fatal("expected IsRepo to be false for empty dir")
+	}
+
+	cmd := exec.Command("git", "init")
+	cmd.Dir = dir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	if !g.IsRepo() {
+		t.Fatal("expected IsRepo to be true after git init")
+	}
+}
+
+func TestCloneWithReferenceCreatesAlternates(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src")
+	dst := filepath.Join(tmp, "dst")
+
+	if err := exec.Command("git", "init", src).Run(); err != nil {
+		t.Fatalf("init src: %v", err)
+	}
+	_ = exec.Command("git", "-C", src, "config", "user.email", "test@test.com").Run()
+	_ = exec.Command("git", "-C", src, "config", "user.name", "Test User").Run()
+
+	if err := os.WriteFile(filepath.Join(src, "README.md"), []byte("# Test\n"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	_ = exec.Command("git", "-C", src, "add", ".").Run()
+	_ = exec.Command("git", "-C", src, "commit", "-m", "initial").Run()
+
+	g := NewGit(tmp)
+	if err := g.CloneWithReference(src, dst, src); err != nil {
+		t.Fatalf("CloneWithReference: %v", err)
+	}
+
+	alternates := filepath.Join(dst, ".git", "objects", "info", "alternates")
+	if _, err := os.Stat(alternates); err != nil {
+		t.Fatalf("expected alternates file: %v", err)
+	}
+}
+
 func TestCurrentBranch(t *testing.T) {
 	dir := initTestRepo(t)
 	g := NewGit(dir)
@@ -167,8 +214,16 @@ func TestNotARepo(t *testing.T) {
 	g := NewGit(dir)
 
 	_, err := g.CurrentBranch()
-	if err != ErrNotARepo {
-		t.Errorf("expected ErrNotARepo, got %v", err)
+	// ZFC: Check for GitError with raw stderr for agent observation.
+	// Agents decide what "not a git repository" means, not Go code.
+	gitErr, ok := err.(*GitError)
+	if !ok {
+		t.Errorf("expected GitError, got %T: %v", err, err)
+		return
+	}
+	// Verify raw stderr is available for agent observation
+	if gitErr.Stderr == "" {
+		t.Errorf("expected GitError with Stderr, got empty stderr")
 	}
 }
 
@@ -339,4 +394,97 @@ func TestCheckConflicts_WithConflict(t *testing.T) {
 	if !status.Clean {
 		t.Error("expected clean working directory after CheckConflicts")
 	}
+}
+
+// TestCloneBareHasOriginRefs verifies that after CloneBare, origin/* refs
+// are available for worktree creation. This was broken before the fix:
+// bare clones had refspec configured but no fetch was run, so origin/main
+// didn't exist and WorktreeAddFromRef("origin/main") failed.
+//
+// Related: GitHub issue #286
+func TestCloneBareHasOriginRefs(t *testing.T) {
+	tmp := t.TempDir()
+
+	// Create a "remote" repo with a commit on main
+	remoteDir := filepath.Join(tmp, "remote")
+	if err := os.MkdirAll(remoteDir, 0755); err != nil {
+		t.Fatalf("mkdir remote: %v", err)
+	}
+	cmd := exec.Command("git", "init")
+	cmd.Dir = remoteDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	cmd = exec.Command("git", "config", "user.email", "test@test.com")
+	cmd.Dir = remoteDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "config", "user.name", "Test User")
+	cmd.Dir = remoteDir
+	_ = cmd.Run()
+
+	// Create initial commit
+	readmeFile := filepath.Join(remoteDir, "README.md")
+	if err := os.WriteFile(readmeFile, []byte("# Test\n"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	cmd = exec.Command("git", "add", ".")
+	cmd.Dir = remoteDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "commit", "-m", "initial")
+	cmd.Dir = remoteDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+
+	// Get the main branch name (main or master depending on git version)
+	cmd = exec.Command("git", "branch", "--show-current")
+	cmd.Dir = remoteDir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git branch --show-current: %v", err)
+	}
+	mainBranch := string(out[:len(out)-1]) // trim newline
+
+	// Clone as bare repo using our CloneBare function
+	bareDir := filepath.Join(tmp, "bare.git")
+	g := NewGit(tmp)
+	if err := g.CloneBare(remoteDir, bareDir); err != nil {
+		t.Fatalf("CloneBare: %v", err)
+	}
+
+	// Verify origin/main exists (this was the bug - it didn't exist before the fix)
+	bareGit := NewGitWithDir(bareDir, "")
+	cmd = exec.Command("git", "branch", "-r")
+	cmd.Dir = bareDir
+	out, err = cmd.Output()
+	if err != nil {
+		t.Fatalf("git branch -r: %v", err)
+	}
+
+	originMain := "origin/" + mainBranch
+	if !stringContains(string(out), originMain) {
+		t.Errorf("expected %q in remote branches, got: %s", originMain, out)
+	}
+
+	// Verify WorktreeAddFromRef succeeds with origin/main
+	// This is what polecat creation does
+	worktreePath := filepath.Join(tmp, "worktree")
+	if err := bareGit.WorktreeAddFromRef(worktreePath, "test-branch", originMain); err != nil {
+		t.Errorf("WorktreeAddFromRef(%q) failed: %v", originMain, err)
+	}
+
+	// Verify the worktree was created and has the expected file
+	worktreeReadme := filepath.Join(worktreePath, "README.md")
+	if _, err := os.Stat(worktreeReadme); err != nil {
+		t.Errorf("expected README.md in worktree: %v", err)
+	}
+}
+
+func stringContains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

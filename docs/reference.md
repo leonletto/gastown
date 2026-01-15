@@ -7,24 +7,38 @@ Technical reference for Gas Town internals. Read the README first.
 ```
 ~/gt/                           Town root
 ├── .beads/                     Town-level beads (hq-* prefix)
-├── mayor/                      Mayor config
-│   └── town.json
+├── mayor/                      Mayor agent home (town coordinator)
+│   ├── town.json               Town configuration
+│   ├── CLAUDE.md               Mayor context (on disk)
+│   └── .claude/settings.json   Mayor Claude settings
+├── deacon/                     Deacon agent home (background supervisor)
+│   └── .claude/settings.json   Deacon settings (context via gt prime)
 └── <rig>/                      Project container (NOT a git clone)
     ├── config.json             Rig identity
     ├── .beads/ → mayor/rig/.beads
     ├── .repo.git/              Bare repo (shared by worktrees)
     ├── mayor/rig/              Mayor's clone (canonical beads)
-    ├── refinery/rig/           Worktree on main
-    ├── witness/                No clone (monitors only)
-    ├── crew/<name>/            Human workspaces
-    └── polecats/<name>/        Worker worktrees
+    │   └── CLAUDE.md           Per-rig mayor context (on disk)
+    ├── witness/                Witness agent home (monitors only)
+    │   └── .claude/settings.json  (context via gt prime)
+    ├── refinery/               Refinery settings parent
+    │   ├── .claude/settings.json
+    │   └── rig/                Worktree on main
+    │       └── CLAUDE.md       Refinery context (on disk)
+    ├── crew/                   Crew settings parent (shared)
+    │   ├── .claude/settings.json  (context via gt prime)
+    │   └── <name>/rig/         Human workspaces
+    └── polecats/               Polecat settings parent (shared)
+        ├── .claude/settings.json  (context via gt prime)
+        └── <name>/rig/         Worker worktrees
 ```
 
 **Key points:**
 
 - Rig root is a container, not a clone
 - `.repo.git/` is bare - refinery and polecats are worktrees
-- Mayor clone holds canonical `.beads/`, others inherit via redirect
+- Per-rig `mayor/rig/` holds canonical `.beads/`, others inherit via redirect
+- Settings placed in parent dirs (not git clones) for upward traversal
 
 ## Beads Routing
 
@@ -192,17 +206,177 @@ gt mol step done <step>      # Complete a molecule step
 
 ## Environment Variables
 
+Gas Town sets environment variables for each agent session via `config.AgentEnv()`.
+These are set in tmux session environment when agents are spawned.
+
+### Core Variables (All Agents)
+
+| Variable | Purpose | Example |
+|----------|---------|---------|
+| `GT_ROLE` | Agent role type | `mayor`, `witness`, `polecat`, `crew` |
+| `GT_ROOT` | Town root directory | `/home/user/gt` |
+| `BD_ACTOR` | Agent identity for attribution | `gastown/polecats/toast` |
+| `GIT_AUTHOR_NAME` | Commit attribution (same as BD_ACTOR) | `gastown/polecats/toast` |
+| `BEADS_DIR` | Beads database location | `/home/user/gt/gastown/.beads` |
+
+### Rig-Level Variables
+
+| Variable | Purpose | Roles |
+|----------|---------|-------|
+| `GT_RIG` | Rig name | witness, refinery, polecat, crew |
+| `GT_POLECAT` | Polecat worker name | polecat only |
+| `GT_CREW` | Crew worker name | crew only |
+| `BEADS_AGENT_NAME` | Agent name for beads operations | polecat, crew |
+| `BEADS_NO_DAEMON` | Disable beads daemon (isolated context) | polecat, crew |
+
+### Other Variables
+
 | Variable | Purpose |
 |----------|---------|
-| `BD_ACTOR` | Agent identity for attribution (see [identity.md](identity.md)) |
-| `BEADS_DIR` | Point to shared beads database |
-| `BEADS_NO_DAEMON` | Required for worktree polecats |
-| `GIT_AUTHOR_NAME` | Set to BD_ACTOR for commit attribution |
-| `GIT_AUTHOR_EMAIL` | Workspace owner email |
-| `GT_TOWN_ROOT` | Override town root detection |
-| `GT_ROLE` | Agent role type (mayor, polecat, etc.) |
-| `GT_RIG` | Rig name for rig-level agents |
-| `GT_POLECAT` | Polecat name (for polecats only) |
+| `GIT_AUTHOR_EMAIL` | Workspace owner email (from git config) |
+| `GT_TOWN_ROOT` | Override town root detection (manual use) |
+| `CLAUDE_RUNTIME_CONFIG_DIR` | Custom Claude settings directory |
+
+### Environment by Role
+
+| Role | Key Variables |
+|------|---------------|
+| **Mayor** | `GT_ROLE=mayor`, `BD_ACTOR=mayor` |
+| **Deacon** | `GT_ROLE=deacon`, `BD_ACTOR=deacon` |
+| **Boot** | `GT_ROLE=boot`, `BD_ACTOR=deacon-boot` |
+| **Witness** | `GT_ROLE=witness`, `GT_RIG=<rig>`, `BD_ACTOR=<rig>/witness` |
+| **Refinery** | `GT_ROLE=refinery`, `GT_RIG=<rig>`, `BD_ACTOR=<rig>/refinery` |
+| **Polecat** | `GT_ROLE=polecat`, `GT_RIG=<rig>`, `GT_POLECAT=<name>`, `BD_ACTOR=<rig>/polecats/<name>` |
+| **Crew** | `GT_ROLE=crew`, `GT_RIG=<rig>`, `GT_CREW=<name>`, `BD_ACTOR=<rig>/crew/<name>` |
+
+### Doctor Check
+
+The `gt doctor` command verifies that running tmux sessions have correct
+environment variables. Mismatches are reported as warnings:
+
+```
+⚠ env-vars: Found 3 env var mismatch(es) across 1 session(s)
+    hq-mayor: missing GT_ROOT (expected "/home/user/gt")
+```
+
+Fix by restarting sessions: `gt shutdown && gt up`
+
+## Agent Working Directories and Settings
+
+Each agent runs in a specific working directory and has its own Claude settings.
+Understanding this hierarchy is essential for proper configuration.
+
+### Working Directories by Role
+
+| Role | Working Directory | Notes |
+|------|-------------------|-------|
+| **Mayor** | `~/gt/mayor/` | Town-level coordinator, isolated from rigs |
+| **Deacon** | `~/gt/deacon/` | Background supervisor daemon |
+| **Witness** | `~/gt/<rig>/witness/` | No git clone, monitors polecats only |
+| **Refinery** | `~/gt/<rig>/refinery/rig/` | Worktree on main branch |
+| **Crew** | `~/gt/<rig>/crew/<name>/rig/` | Persistent human workspace clone |
+| **Polecat** | `~/gt/<rig>/polecats/<name>/rig/` | Ephemeral worker worktree |
+
+Note: The per-rig `<rig>/mayor/rig/` directory is NOT a working directory—it's
+a git clone that holds the canonical `.beads/` database for that rig.
+
+### Settings File Locations
+
+Claude Code searches for `.claude/settings.json` starting from the working
+directory and traversing upward. Settings are placed in **parent directories**
+(not inside git clones) so they're found via directory traversal without
+polluting source repositories:
+
+```
+~/gt/
+├── mayor/.claude/settings.json          # Mayor settings
+├── deacon/.claude/settings.json         # Deacon settings
+└── <rig>/
+    ├── witness/.claude/settings.json    # Witness settings (no rig/ subdir)
+    ├── refinery/.claude/settings.json   # Found by refinery/rig/ via traversal
+    ├── crew/.claude/settings.json       # Shared by all crew/<name>/rig/
+    └── polecats/.claude/settings.json   # Shared by all polecats/<name>/rig/
+```
+
+**Why parent directories?** Agents working in git clones (like `refinery/rig/`)
+would pollute the source repo if settings were placed there. By putting settings
+one level up, Claude finds them via upward traversal, and all workers of the
+same type share the same settings.
+
+### CLAUDE.md Locations
+
+Role context is delivered via CLAUDE.md files or ephemeral injection:
+
+| Role | CLAUDE.md Location | Method |
+|------|-------------------|--------|
+| **Mayor** | `~/gt/mayor/CLAUDE.md` | On disk |
+| **Deacon** | (none) | Injected via `gt prime` at SessionStart |
+| **Witness** | (none) | Injected via `gt prime` at SessionStart |
+| **Refinery** | `<rig>/refinery/rig/CLAUDE.md` | On disk (inside worktree) |
+| **Crew** | (none) | Injected via `gt prime` at SessionStart |
+| **Polecat** | (none) | Injected via `gt prime` at SessionStart |
+
+Additionally, each rig has `<rig>/mayor/rig/CLAUDE.md` for the per-rig mayor clone
+(used for beads operations, not a running agent).
+
+**Why ephemeral injection?** Writing CLAUDE.md into git clones would:
+1. Pollute source repos when agents commit/push
+2. Leak Gas Town internals into project history
+3. Conflict with project-specific CLAUDE.md files
+
+The `gt prime` command runs at SessionStart hook and injects context without
+persisting it to disk.
+
+### Sparse Checkout (Source Repo Isolation)
+
+When agents work on source repositories that have their own Claude Code configuration,
+Gas Town uses git sparse checkout to exclude all context files:
+
+```bash
+# Automatically configured for worktrees - excludes:
+# - .claude/       : settings, rules, agents, commands
+# - CLAUDE.md      : primary context file
+# - CLAUDE.local.md: personal context file
+# - .mcp.json      : MCP server configuration
+git sparse-checkout set --no-cone '/*' '!/.claude/' '!/CLAUDE.md' '!/CLAUDE.local.md' '!/.mcp.json'
+```
+
+This ensures agents use Gas Town's context, not the source repo's instructions.
+
+**Doctor check**: `gt doctor` verifies sparse checkout is configured correctly.
+Run `gt doctor --fix` to update legacy configurations missing the newer patterns.
+
+### Settings Inheritance
+
+Claude Code's settings search order (first match wins):
+
+1. `.claude/settings.json` in current working directory
+2. `.claude/settings.json` in parent directories (traversing up)
+3. `~/.claude/settings.json` (user global settings)
+
+Gas Town places settings at each agent's working directory root, so agents
+find their role-specific settings before reaching any parent or global config.
+
+### Settings Templates
+
+Gas Town uses two settings templates based on role type:
+
+| Type | Roles | Key Difference |
+|------|-------|----------------|
+| **Interactive** | Mayor, Crew | Mail injected on `UserPromptSubmit` hook |
+| **Autonomous** | Polecat, Witness, Refinery, Deacon | Mail injected on `SessionStart` hook |
+
+Autonomous agents may start without user input, so they need mail checked
+at session start. Interactive agents wait for user prompts.
+
+### Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| Agent using wrong settings | Check `gt doctor`, verify sparse checkout |
+| Settings not found | Ensure `.claude/settings.json` exists at role home |
+| Source repo settings leaking | Run `gt doctor --fix` to configure sparse checkout |
+| Mayor settings affecting polecats | Mayor should run in `mayor/`, not town root |
 
 ## CLI Reference
 
@@ -213,6 +387,69 @@ gt install [path]            # Create town
 gt install --git             # With git init
 gt doctor                    # Health check
 gt doctor --fix              # Auto-repair
+```
+
+### Configuration
+
+```bash
+# Agent management
+gt config agent list [--json]     # List all agents (built-in + custom)
+gt config agent get <name>        # Show agent configuration
+gt config agent set <name> <cmd>  # Create or update custom agent
+gt config agent remove <name>     # Remove custom agent (built-ins protected)
+
+# Default agent
+gt config default-agent [name]    # Get or set town default agent
+```
+
+**Built-in agents**: `claude`, `gemini`, `codex`, `cursor`, `auggie`, `amp`
+
+**Custom agents**: Define per-town via CLI or JSON:
+```bash
+gt config agent set claude-glm "claude-glm --model glm-4"
+gt config agent set claude "claude-opus"  # Override built-in
+gt config default-agent claude-glm       # Set default
+```
+
+**Advanced agent config** (`settings/agents.json`):
+```json
+{
+  "version": 1,
+  "agents": {
+    "opencode": {
+      "command": "opencode",
+      "args": [],
+      "resume_flag": "--session",
+      "resume_style": "flag",
+      "non_interactive": {
+        "subcommand": "run",
+        "output_flag": "--format json"
+      }
+    }
+  }
+}
+```
+
+**Rig-level agents** (`<rig>/settings/config.json`):
+```json
+{
+  "type": "rig-settings",
+  "version": 1,
+  "agent": "opencode",
+  "agents": {
+    "opencode": {
+      "command": "opencode",
+      "args": ["--session"]
+    }
+  }
+}
+```
+
+**Agent resolution order**: rig-level → town-level → built-in presets.
+
+For OpenCode autonomous mode, set env var in your shell profile:
+```bash
+export OPENCODE_PERMISSION='{"*":"allow"}'
 ```
 
 ### Rig Management
@@ -234,7 +471,7 @@ gt convoy list --all                    # Include landed convoys
 gt convoy list --status=closed          # Only landed convoys
 ```
 
-Note: "Swarm" is ephemeral (workers on a convoy's issues). See [Convoys](convoy.md).
+Note: "Swarm" is ephemeral (workers on a convoy's issues). See [Convoys](concepts/convoy.md).
 
 ### Work Assignment
 
@@ -242,11 +479,18 @@ Note: "Swarm" is ephemeral (workers on a convoy's issues). See [Convoys](convoy.
 # Standard workflow: convoy first, then sling
 gt convoy create "Feature X" gt-abc gt-def
 gt sling gt-abc <rig>                    # Assign to polecat
-gt sling gt-def <rig> --molecule=<proto> # With workflow template
+gt sling gt-abc <rig> --agent codex      # Override runtime for this sling/spawn
+gt sling <proto> --on gt-def <rig>       # With workflow template
 
 # Quick sling (auto-creates convoy)
 gt sling <bead> <rig>                    # Auto-convoy for dashboard visibility
 ```
+
+Agent overrides:
+
+- `gt start --agent <alias>` overrides the Mayor/Deacon runtime for this launch.
+- `gt mayor start|attach|restart --agent <alias>` and `gt deacon start|attach|restart --agent <alias>` do the same.
+- `gt start crew <name> --agent <alias>` and `gt crew at <name> --agent <alias>` override the crew worker runtime.
 
 ### Communication
 
@@ -266,7 +510,7 @@ gt escalate -s HIGH "msg"        # Important blocker
 gt escalate -s MEDIUM "msg" -m "Details..."
 ```
 
-See [escalation.md](escalation.md) for full protocol.
+See [escalation.md](design/escalation.md) for full protocol.
 
 ### Sessions
 
@@ -323,7 +567,7 @@ Deacon, Witness, and Refinery run continuous patrol loops using wisps:
 |-------|-----------------|----------------|
 | **Deacon** | `mol-deacon-patrol` | Agent lifecycle, plugin execution, health checks |
 | **Witness** | `mol-witness-patrol` | Monitor polecats, nudge stuck workers |
-| **Refinery** | `mol-refinery-patrol` | Process merge queue, review PRs |
+| **Refinery** | `mol-refinery-patrol` | Process merge queue, review MRs |
 
 ```
 1. bd mol wisp mol-<role>-patrol
@@ -367,4 +611,4 @@ bd mol bond mol-security-scan $PATROL_ID --var scope="$SCOPE"
 
 **Nondeterministic idempotence**: Any worker can continue any molecule. Steps are atomic checkpoints in beads.
 
-**Convoy tracking**: Convoys track batched work across rigs. A "swarm" is ephemeral - just the workers currently on a convoy's issues. See [Convoys](convoy.md) for details.
+**Convoy tracking**: Convoys track batched work across rigs. A "swarm" is ephemeral - just the workers currently on a convoy's issues. See [Convoys](concepts/convoy.md) for details.

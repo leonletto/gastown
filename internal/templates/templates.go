@@ -24,14 +24,18 @@ type Templates struct {
 
 // RoleData contains information for rendering role contexts.
 type RoleData struct {
-	Role        string   // mayor, witness, refinery, polecat, crew, deacon
-	RigName     string   // e.g., "greenplace"
-	TownRoot    string   // e.g., "/Users/steve/ai"
-	WorkDir     string   // current working directory
-	Polecat     string   // polecat name (for polecat role)
-	Polecats    []string // list of polecats (for witness role)
-	BeadsDir    string   // BEADS_DIR path
-	IssuePrefix string   // beads issue prefix
+	Role           string   // mayor, witness, refinery, polecat, crew, deacon
+	RigName        string   // e.g., "greenplace"
+	TownRoot       string   // e.g., "/Users/steve/ai"
+	TownName       string   // e.g., "ai" - the town identifier for session names
+	WorkDir        string   // current working directory
+	DefaultBranch  string   // default branch for merges (e.g., "main", "develop")
+	Polecat        string   // polecat name (for polecat role)
+	Polecats       []string // list of polecats (for witness role)
+	BeadsDir       string   // BEADS_DIR path
+	IssuePrefix    string   // beads issue prefix
+	MayorSession   string   // e.g., "gt-ai-mayor" - dynamic mayor session name
+	DeaconSession  string   // e.g., "gt-ai-deacon" - dynamic deacon session name
 }
 
 // SpawnData contains information for spawn assignment messages.
@@ -132,6 +136,32 @@ func (t *Templates) MessageNames() []string {
 	return []string{"spawn", "nudge", "escalation", "handoff"}
 }
 
+// CreateMayorCLAUDEmd creates the Mayor's CLAUDE.md file at the specified directory.
+// This is used by both gt install and gt doctor --fix.
+func CreateMayorCLAUDEmd(mayorDir, townRoot, townName, mayorSession, deaconSession string) error {
+	tmpl, err := New()
+	if err != nil {
+		return err
+	}
+
+	data := RoleData{
+		Role:          "mayor",
+		TownRoot:      townRoot,
+		TownName:      townName,
+		WorkDir:       mayorDir,
+		MayorSession:  mayorSession,
+		DeaconSession: deaconSession,
+	}
+
+	content, err := tmpl.RenderRole("mayor", data)
+	if err != nil {
+		return err
+	}
+
+	claudePath := filepath.Join(mayorDir, "CLAUDE.md")
+	return os.WriteFile(claudePath, []byte(content), 0644)
+}
+
 // GetAllRoleTemplates returns all role templates as a map of filename to content.
 func GetAllRoleTemplates() (map[string][]byte, error) {
 	entries, err := templateFS.ReadDir("roles")
@@ -187,7 +217,7 @@ func ProvisionCommands(workspacePath string) error {
 			return fmt.Errorf("reading %s: %w", entry.Name(), err)
 		}
 
-		if err := os.WriteFile(destPath, content, 0644); err != nil {
+		if err := os.WriteFile(destPath, content, 0644); err != nil { //nolint:gosec // G306: template files are non-sensitive
 			return fmt.Errorf("writing %s: %w", entry.Name(), err)
 		}
 	}

@@ -13,9 +13,23 @@ import (
 // correct, so we pass the session name explicitly via #{session_name} expansion.
 var townCycleSession string
 
-// Town-level sessions that participate in cycling (mayor, deacon).
-// These are the session names without the "gt-" prefix.
-var townLevelSessions = []string{"gt-mayor", "gt-deacon"}
+// getTownLevelSessions returns the town-level session names for the current workspace.
+func getTownLevelSessions() []string {
+	mayorSession := getMayorSessionName()
+	deaconSession := getDeaconSessionName()
+	return []string{mayorSession, deaconSession}
+}
+
+// isTownLevelSession checks if the given session name is a town-level session.
+// Town-level sessions (Mayor, Deacon) use the "hq-" prefix, so we can identify
+// them by name alone without requiring workspace context. This is critical for
+// tmux run-shell which may execute from outside the workspace directory.
+func isTownLevelSession(sessionName string) bool {
+	// Town-level sessions are identified by their fixed names
+	mayorSession := getMayorSessionName()  // "hq-mayor"
+	deaconSession := getDeaconSessionName() // "hq-deacon"
+	return sessionName == mayorSession || sessionName == deaconSession
+}
 
 func init() {
 	rootCmd.AddCommand(townCmd)
@@ -78,15 +92,7 @@ func cycleTownSession(direction int, sessionOverride string) error {
 	}
 
 	// Check if current session is a town-level session
-	isTownSession := false
-	for _, s := range townLevelSessions {
-		if s == currentSession {
-			isTownSession = true
-			break
-		}
-	}
-
-	if !isTownSession {
+	if !isTownLevelSession(currentSession) {
 		// Not a town session - no cycling, just stay put
 		return nil
 	}
@@ -143,6 +149,12 @@ func findRunningTownSessions() ([]string, error) {
 	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
 	if err != nil {
 		return nil, fmt.Errorf("listing tmux sessions: %w", err)
+	}
+
+	// Get town-level session names
+	townLevelSessions := getTownLevelSessions()
+	if townLevelSessions == nil {
+		return nil, fmt.Errorf("cannot determine town-level sessions")
 	}
 
 	var running []string

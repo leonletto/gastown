@@ -46,8 +46,21 @@ pinned molecule (steps poured from `mol-polecat-work`) and signal completion to 
 You:
 1. Receive work via your hook (pinned molecule + issue)
 2. Work through molecule steps using `bd ready` / `bd close <step>`
-3. Signal completion and exit (`gt done --exit`)
-4. Witness handles cleanup, Refinery merges
+3. Complete and self-clean (`gt done`) - you exit AND nuke yourself
+4. Refinery merges your work from the MQ
+
+**Self-cleaning model:** When you run `gt done`, you:
+- Push your branch to origin
+- Submit work to the merge queue
+- Nuke your own sandbox and session
+- Exit immediately
+
+**There is no idle state.** Polecats have exactly three operating states:
+- **Working** - actively doing assigned work (normal)
+- **Stalled** - session stopped mid-work (failure: should be working)
+- **Zombie** - `gt done` failed during cleanup (failure: should be dead)
+
+Done means gone. If `gt done` succeeds, you cease to exist.
 
 **Important:** Your molecule already has step beads. Use `bd ready` to find them.
 Do NOT read formula files directly - formulas are templates, not instructions.
@@ -106,7 +119,6 @@ bd close <step-id>          # Mark step complete
 git status                  # Check working tree
 git add <files>             # Stage changes
 git commit -m "msg (issue)" # Commit with issue reference
-git push                    # Push your branch
 ```
 
 ### Communication
@@ -149,38 +161,51 @@ When your work is done, follow this EXACT checklist:
 
 ```
 [ ] 1. Tests pass:        go test ./...
-[ ] 2. COMMIT changes:    git add <files> && git commit -m "msg (issue-id)"
-[ ] 3. Push branch:       git push -u origin HEAD
-[ ] 4. Close issue:       bd close <issue> --reason "..."
-[ ] 5. Sync beads:        bd sync
-[ ] 6. Exit session:      gt done --exit
+[ ] 2. Commit changes:    git add <files> && git commit -m "msg (issue-id)"
+[ ] 3. Sync beads:        bd sync
+[ ] 4. Self-clean:        gt done
 ```
 
-**CRITICAL**: You MUST commit and push BEFORE running `gt done --exit`.
-If you skip the commit, your work will be lost!
+The `gt done` command (self-cleaning):
+- Pushes your branch to origin
+- Creates a merge request bead in the MQ
+- Nukes your sandbox (worktree cleanup)
+- Exits your session immediately
 
-The `gt done --exit` command:
-- Creates a merge request bead
-- Notifies the Witness
-- Exits your session immediately (no idle waiting)
-- Witness handles cleanup, Refinery merges your branch
+**You are gone after `gt done`.** The session shuts down - there's no idle state
+where you wait for more work. The Refinery will merge your work from the MQ.
+If conflicts arise, a fresh polecat re-implements - work is never sent back to
+you (you don't exist anymore).
+
+### No PRs in Maintainer Repos
+
+If the remote origin is `steveyegge/beads` or `steveyegge/gastown`:
+- **NEVER create GitHub PRs** - you have direct push access
+- Polecats: use `gt done` → Refinery merges to main
+- Crew workers: push directly to main
+
+PRs are for external contributors submitting to repos they don't own.
+Check `git remote -v` if unsure about repo ownership.
 
 ### The Landing Rule
 
 > **Work is NOT landed until it's on `main` OR in the Refinery MQ.**
 
-Your branch sitting on origin is NOT landed. You must run `gt done` to submit it
-to the merge queue. Without this step:
+Your local branch is NOT landed. You must run `gt done` to submit it to the
+merge queue. Without this step:
 - Your work is invisible to other agents
 - The branch will go stale as main diverges
 - Merge conflicts will compound over time
 - Work can be lost if your polecat is recycled
 
-**Branch → `gt done` → MR in queue → Refinery merges → LANDED**
+**Local branch → `gt done` → MR in queue → Refinery merges → LANDED**
 
 ---
 
 ## Self-Managed Session Lifecycle
+
+> See [Polecat Lifecycle](docs/polecat-lifecycle.md) for the full three-layer architecture
+> (session/sandbox/slot).
 
 **You own your session cadence.** The Witness monitors but doesn't force recycles.
 
@@ -217,8 +242,10 @@ If you forget to handoff:
 - Work continues from hook (molecule state preserved)
 - No work is lost
 
-**The Witness role**: Witness monitors for stuck polecats (long idle on same step)
-but does NOT force recycle between steps. You manage your own session lifecycle.
+**The Witness role**: Witness monitors for stalled polecats (sessions that stopped
+unexpectedly) but does NOT force recycle between steps. You manage your own session
+lifecycle. Note: "stalled" means you stopped when you should be working - it's not
+an idle state.
 
 ---
 

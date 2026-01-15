@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/mail"
-	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -59,12 +59,12 @@ func (m *Manager) ExecuteLanding(swarmID string, config LandingConfig) (*Landing
 
 	// Phase 1: Stop all polecat sessions
 	t := tmux.NewTmux()
-	sessMgr := session.NewManager(t, m.rig)
+	polecatMgr := polecat.NewSessionManager(t, m.rig)
 
 	for _, worker := range swarm.Workers {
-		running, _ := sessMgr.IsRunning(worker)
+		running, _ := polecatMgr.IsRunning(worker)
 		if running {
-			err := sessMgr.Stop(worker, config.ForceKill)
+			err := polecatMgr.Stop(worker, config.ForceKill)
 			if err != nil {
 				// Continue anyway
 			} else {
@@ -195,7 +195,7 @@ func (m *Manager) gitRunOutput(dir string, args ...string) (string, error) {
 }
 
 // notifyMayorCodeAtRisk sends an alert to Mayor about code at risk.
-func (m *Manager) notifyMayorCodeAtRisk(townRoot, swarmID string, workers []string) {
+func (m *Manager) notifyMayorCodeAtRisk(_, swarmID string, workers []string) { // townRoot unused: router uses gitDir
 	router := mail.NewRouter(m.gitDir)
 	msg := &mail.Message{
 		From: fmt.Sprintf("%s/refinery", m.rig.Name),
@@ -214,7 +214,7 @@ Manual intervention required.`,
 }
 
 // notifyMayorLanded sends a landing report to Mayor.
-func (m *Manager) notifyMayorLanded(townRoot string, swarm *Swarm, result *LandingResult) {
+func (m *Manager) notifyMayorLanded(_ string, swarm *Swarm, result *LandingResult) { // townRoot unused: router uses gitDir
 	router := mail.NewRouter(m.gitDir)
 	msg := &mail.Message{
 		From: fmt.Sprintf("%s/refinery", m.rig.Name),

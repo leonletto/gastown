@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,6 +26,7 @@ func NewBeadsDatabaseCheck() *BeadsDatabaseCheck {
 			BaseCheck: BaseCheck{
 				CheckName:        "beads-database",
 				CheckDescription: "Verify beads database is properly initialized",
+				CheckCategory:    CategoryConfig,
 			},
 		},
 	}
@@ -175,6 +177,7 @@ func NewPrefixConflictCheck() *PrefixConflictCheck {
 		BaseCheck: BaseCheck{
 			CheckName:        "prefix-conflict",
 			CheckDescription: "Check for duplicate beads prefixes across rigs",
+			CheckCategory:    CategoryConfig,
 		},
 	}
 }
@@ -224,4 +227,350 @@ func (c *PrefixConflictCheck) Run(ctx *CheckContext) *CheckResult {
 		Details: details,
 		FixHint: "Use 'bd rename-prefix <new-prefix>' in one of the conflicting rigs to resolve",
 	}
+}
+
+// PrefixMismatchCheck detects when rigs.json has a different prefix than what
+// routes.jsonl actually uses for a rig. This can happen when:
+// - deriveBeadsPrefix() generates a different prefix than what's in the beads DB
+// - Someone manually edited rigs.json with the wrong prefix
+// - The beads were initialized before auto-derive existed with a different prefix
+type PrefixMismatchCheck struct {
+	FixableCheck
+}
+
+// NewPrefixMismatchCheck creates a new prefix mismatch check.
+func NewPrefixMismatchCheck() *PrefixMismatchCheck {
+	return &PrefixMismatchCheck{
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "prefix-mismatch",
+				CheckDescription: "Check for prefix mismatches between rigs.json and routes.jsonl",
+				CheckCategory:    CategoryConfig,
+			},
+		},
+	}
+}
+
+// Run checks for prefix mismatches between rigs.json and routes.jsonl.
+func (c *PrefixMismatchCheck) Run(ctx *CheckContext) *CheckResult {
+	beadsDir := filepath.Join(ctx.TownRoot, ".beads")
+
+	// Load routes.jsonl
+	routes, err := beads.LoadRoutes(beadsDir)
+	if err != nil {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusWarning,
+			Message: fmt.Sprintf("Could not load routes.jsonl: %v", err),
+		}
+	}
+	if len(routes) == 0 {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No routes configured (nothing to check)",
+		}
+	}
+
+	// Load rigs.json
+	rigsPath := filepath.Join(ctx.TownRoot, "mayor", "rigs.json")
+	rigsConfig, err := loadRigsConfig(rigsPath)
+	if err != nil {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No rigs.json found (nothing to check)",
+		}
+	}
+
+	// Build map of route path -> prefix from routes.jsonl
+	routePrefixByPath := make(map[string]string)
+	for _, r := range routes {
+		// Normalize: strip trailing hyphen from prefix for comparison
+		prefix := strings.TrimSuffix(r.Prefix, "-")
+		routePrefixByPath[r.Path] = prefix
+	}
+
+	// Check each rig in rigs.json against routes.jsonl
+	var mismatches []string
+	mismatchData := make(map[string][2]string) // rigName -> [rigsJsonPrefix, routesPrefix]
+
+	for rigName, rigEntry := range rigsConfig.Rigs {
+		// Skip rigs without beads config
+		if rigEntry.BeadsConfig == nil || rigEntry.BeadsConfig.Prefix == "" {
+			continue
+		}
+
+		rigsJsonPrefix := rigEntry.BeadsConfig.Prefix
+		expectedPath := rigName + "/mayor/rig"
+
+		// Find the route for this rig
+		routePrefix, hasRoute := routePrefixByPath[expectedPath]
+		if !hasRoute {
+			// No route for this rig - routes-config check handles this
+			continue
+		}
+
+		// Compare prefixes (both should be without trailing hyphen)
+		if rigsJsonPrefix != routePrefix {
+			mismatches = append(mismatches, rigName)
+			mismatchData[rigName] = [2]string{rigsJsonPrefix, routePrefix}
+		}
+	}
+
+	if len(mismatches) == 0 {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No prefix mismatches found",
+		}
+	}
+
+	// Build details
+	var details []string
+	for _, rigName := range mismatches {
+		data := mismatchData[rigName]
+		details = append(details, fmt.Sprintf("Rig '%s': rigs.json says '%s', routes.jsonl uses '%s'",
+			rigName, data[0], data[1]))
+	}
+
+	return &CheckResult{
+		Name:    c.Name(),
+		Status:  StatusWarning,
+		Message: fmt.Sprintf("%d prefix mismatch(es) between rigs.json and routes.jsonl", len(mismatches)),
+		Details: details,
+		FixHint: "Run 'gt doctor --fix' to update rigs.json with correct prefixes",
+	}
+}
+
+// Fix updates rigs.json to match the prefixes in routes.jsonl.
+func (c *PrefixMismatchCheck) Fix(ctx *CheckContext) error {
+	beadsDir := filepath.Join(ctx.TownRoot, ".beads")
+
+	// Load routes.jsonl
+	routes, err := beads.LoadRoutes(beadsDir)
+	if err != nil || len(routes) == 0 {
+		return nil // Nothing to fix
+	}
+
+	// Load rigs.json
+	rigsPath := filepath.Join(ctx.TownRoot, "mayor", "rigs.json")
+	rigsConfig, err := loadRigsConfig(rigsPath)
+	if err != nil {
+		return nil // Nothing to fix
+	}
+
+	// Build map of route path -> prefix from routes.jsonl
+	routePrefixByPath := make(map[string]string)
+	for _, r := range routes {
+		prefix := strings.TrimSuffix(r.Prefix, "-")
+		routePrefixByPath[r.Path] = prefix
+	}
+
+	// Update each rig's prefix to match routes.jsonl
+	modified := false
+	for rigName, rigEntry := range rigsConfig.Rigs {
+		expectedPath := rigName + "/mayor/rig"
+		routePrefix, hasRoute := routePrefixByPath[expectedPath]
+		if !hasRoute {
+			continue
+		}
+
+		// Ensure BeadsConfig exists
+		if rigEntry.BeadsConfig == nil {
+			rigEntry.BeadsConfig = &rigsConfigBeadsConfig{}
+		}
+
+		if rigEntry.BeadsConfig.Prefix != routePrefix {
+			rigEntry.BeadsConfig.Prefix = routePrefix
+			rigsConfig.Rigs[rigName] = rigEntry
+			modified = true
+		}
+	}
+
+	if modified {
+		return saveRigsConfig(rigsPath, rigsConfig)
+	}
+
+	return nil
+}
+
+// rigsConfigEntry is a local type for loading rigs.json without importing config package
+// to avoid circular dependencies and keep the check self-contained.
+type rigsConfigEntry struct {
+	GitURL      string                 `json:"git_url"`
+	LocalRepo   string                 `json:"local_repo,omitempty"`
+	AddedAt     string                 `json:"added_at"` // Keep as string to preserve format
+	BeadsConfig *rigsConfigBeadsConfig `json:"beads,omitempty"`
+}
+
+type rigsConfigBeadsConfig struct {
+	Repo   string `json:"repo"`
+	Prefix string `json:"prefix"`
+}
+
+type rigsConfigFile struct {
+	Version int                         `json:"version"`
+	Rigs    map[string]rigsConfigEntry  `json:"rigs"`
+}
+
+func loadRigsConfig(path string) (*rigsConfigFile, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg rigsConfigFile
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+
+	return &cfg, nil
+}
+
+func saveRigsConfig(path string, cfg *rigsConfigFile) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0644)
+}
+
+// beadShower is an interface for fetching bead information.
+// Allows mocking in tests.
+type beadShower interface {
+	Show(id string) (*beads.Issue, error)
+}
+
+// labelAdder is an interface for adding labels to beads.
+// Allows mocking in tests.
+type labelAdder interface {
+	AddLabel(townRoot, id, label string) error
+}
+
+// realLabelAdder implements labelAdder using bd command.
+type realLabelAdder struct{}
+
+func (r *realLabelAdder) AddLabel(townRoot, id, label string) error {
+	cmd := exec.Command("bd", "label", "add", id, label)
+	cmd.Dir = townRoot
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("adding %s label to %s: %s", label, id, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// RoleLabelCheck verifies that role beads have the gt:role label.
+// This label is required for GetRoleConfig to recognize role beads.
+// Role beads created before the label migration may be missing this label.
+type RoleLabelCheck struct {
+	FixableCheck
+	missingLabel []string // Role bead IDs missing gt:role label
+	townRoot     string   // Cached for Fix
+
+	// Injected dependencies for testing
+	beadShower beadShower
+	labelAdder labelAdder
+}
+
+// NewRoleLabelCheck creates a new role label check.
+func NewRoleLabelCheck() *RoleLabelCheck {
+	return &RoleLabelCheck{
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "role-bead-labels",
+				CheckDescription: "Check that role beads have gt:role label",
+				CheckCategory:    CategoryConfig,
+			},
+		},
+		labelAdder: &realLabelAdder{},
+	}
+}
+
+// roleBeadIDs returns the list of role bead IDs to check.
+func roleBeadIDs() []string {
+	return []string{
+		beads.MayorRoleBeadIDTown(),
+		beads.DeaconRoleBeadIDTown(),
+		beads.DogRoleBeadIDTown(),
+		beads.WitnessRoleBeadIDTown(),
+		beads.RefineryRoleBeadIDTown(),
+		beads.PolecatRoleBeadIDTown(),
+		beads.CrewRoleBeadIDTown(),
+	}
+}
+
+// Run checks if role beads have the gt:role label.
+func (c *RoleLabelCheck) Run(ctx *CheckContext) *CheckResult {
+	// Check if bd command is available (skip if testing with mock)
+	if c.beadShower == nil {
+		if _, err := exec.LookPath("bd"); err != nil {
+			return &CheckResult{
+				Name:    c.Name(),
+				Status:  StatusOK,
+				Message: "beads not installed (skipped)",
+			}
+		}
+	}
+
+	// Check if .beads directory exists at town level
+	townBeadsDir := filepath.Join(ctx.TownRoot, ".beads")
+	if _, err := os.Stat(townBeadsDir); os.IsNotExist(err) {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "No beads database (skipped)",
+		}
+	}
+
+	// Use injected beadShower or create real one
+	shower := c.beadShower
+	if shower == nil {
+		shower = beads.New(ctx.TownRoot)
+	}
+
+	var missingLabel []string
+	for _, roleID := range roleBeadIDs() {
+		issue, err := shower.Show(roleID)
+		if err != nil {
+			// Bead doesn't exist - that's OK, install will create it
+			continue
+		}
+
+		// Check if it has the gt:role label
+		if !beads.HasLabel(issue, "gt:role") {
+			missingLabel = append(missingLabel, roleID)
+		}
+	}
+
+	// Cache for Fix
+	c.missingLabel = missingLabel
+	c.townRoot = ctx.TownRoot
+
+	if len(missingLabel) == 0 {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "All role beads have gt:role label",
+		}
+	}
+
+	return &CheckResult{
+		Name:    c.Name(),
+		Status:  StatusWarning,
+		Message: fmt.Sprintf("%d role bead(s) missing gt:role label", len(missingLabel)),
+		Details: missingLabel,
+		FixHint: "Run 'gt doctor --fix' to add missing labels",
+	}
+}
+
+// Fix adds the gt:role label to role beads that are missing it.
+func (c *RoleLabelCheck) Fix(ctx *CheckContext) error {
+	for _, roleID := range c.missingLabel {
+		if err := c.labelAdder.AddLabel(c.townRoot, roleID, "gt:role"); err != nil {
+			return err
+		}
+	}
+	return nil
 }

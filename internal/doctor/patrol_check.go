@@ -28,6 +28,7 @@ func NewPatrolMoleculesExistCheck() *PatrolMoleculesExistCheck {
 			BaseCheck: BaseCheck{
 				CheckName:        "patrol-molecules-exist",
 				CheckDescription: "Check if patrol molecules exist for each rig",
+				CheckCategory:    CategoryPatrol,
 			},
 		},
 	}
@@ -115,7 +116,7 @@ func (c *PatrolMoleculesExistCheck) Fix(ctx *CheckContext) error {
 		rigPath := filepath.Join(ctx.TownRoot, rigName)
 		for _, mol := range missing {
 			desc := getPatrolMoleculeDesc(mol)
-			cmd := exec.Command("bd", "create",
+			cmd := exec.Command("bd", "create", //nolint:gosec // G204: args are constructed internally
 				"--type=molecule",
 				"--title="+mol,
 				"--description="+desc,
@@ -145,34 +146,37 @@ func getPatrolMoleculeDesc(title string) string {
 
 // PatrolHooksWiredCheck verifies that hooks trigger patrol execution.
 type PatrolHooksWiredCheck struct {
-	BaseCheck
+	FixableCheck
 }
 
 // NewPatrolHooksWiredCheck creates a new patrol hooks wired check.
 func NewPatrolHooksWiredCheck() *PatrolHooksWiredCheck {
 	return &PatrolHooksWiredCheck{
-		BaseCheck: BaseCheck{
-			CheckName:        "patrol-hooks-wired",
-			CheckDescription: "Check if hooks trigger patrol execution",
+		FixableCheck: FixableCheck{
+			BaseCheck: BaseCheck{
+				CheckName:        "patrol-hooks-wired",
+				CheckDescription: "Check if hooks trigger patrol execution",
+				CheckCategory:    CategoryPatrol,
+			},
 		},
 	}
 }
 
 // Run checks if patrol hooks are wired.
 func (c *PatrolHooksWiredCheck) Run(ctx *CheckContext) *CheckResult {
-	// Check for daemon config which manages patrols
-	daemonConfigPath := filepath.Join(ctx.TownRoot, "mayor", "daemon.json")
+	daemonConfigPath := config.DaemonPatrolConfigPath(ctx.TownRoot)
+	relPath, _ := filepath.Rel(ctx.TownRoot, daemonConfigPath)
+
 	if _, err := os.Stat(daemonConfigPath); os.IsNotExist(err) {
 		return &CheckResult{
 			Name:    c.Name(),
 			Status:  StatusWarning,
-			Message: "Daemon config not found",
-			FixHint: "Run 'gt daemon init' to configure daemon",
+			Message: fmt.Sprintf("%s not found", relPath),
+			FixHint: "Run 'gt doctor --fix' to create default config, or 'gt daemon start' to start the daemon",
 		}
 	}
 
-	// Check daemon config for patrol configuration
-	data, err := os.ReadFile(daemonConfigPath)
+	cfg, err := config.LoadDaemonPatrolConfig(daemonConfigPath)
 	if err != nil {
 		return &CheckResult{
 			Name:    c.Name(),
@@ -182,46 +186,33 @@ func (c *PatrolHooksWiredCheck) Run(ctx *CheckContext) *CheckResult {
 		}
 	}
 
-	var config map[string]interface{}
-	if err := json.Unmarshal(data, &config); err != nil {
+	if len(cfg.Patrols) > 0 {
 		return &CheckResult{
 			Name:    c.Name(),
-			Status:  StatusWarning,
-			Message: "Invalid daemon config format",
-			Details: []string{err.Error()},
+			Status:  StatusOK,
+			Message: fmt.Sprintf("Daemon configured with %d patrol(s)", len(cfg.Patrols)),
 		}
 	}
 
-	// Check for patrol entries
-	if patrols, ok := config["patrols"]; ok {
-		if patrolMap, ok := patrols.(map[string]interface{}); ok && len(patrolMap) > 0 {
-			return &CheckResult{
-				Name:    c.Name(),
-				Status:  StatusOK,
-				Message: fmt.Sprintf("Daemon configured with %d patrol(s)", len(patrolMap)),
-			}
-		}
-	}
-
-	// Check if heartbeat is enabled (triggers deacon patrol)
-	if heartbeat, ok := config["heartbeat"]; ok {
-		if hb, ok := heartbeat.(map[string]interface{}); ok {
-			if enabled, ok := hb["enabled"].(bool); ok && enabled {
-				return &CheckResult{
-					Name:    c.Name(),
-					Status:  StatusOK,
-					Message: "Daemon heartbeat enabled (triggers patrols)",
-				}
-			}
+	if cfg.Heartbeat != nil && cfg.Heartbeat.Enabled {
+		return &CheckResult{
+			Name:    c.Name(),
+			Status:  StatusOK,
+			Message: "Daemon heartbeat enabled (triggers patrols)",
 		}
 	}
 
 	return &CheckResult{
 		Name:    c.Name(),
 		Status:  StatusWarning,
-		Message: "Patrol hooks not configured in daemon",
-		FixHint: "Configure patrols in mayor/daemon.json or run 'gt daemon init'",
+		Message: fmt.Sprintf("Configure patrols in %s or run 'gt daemon start'", relPath),
+		FixHint: "Run 'gt doctor --fix' to create default config",
 	}
+}
+
+// Fix creates the daemon patrol config with defaults.
+func (c *PatrolHooksWiredCheck) Fix(ctx *CheckContext) error {
+	return config.EnsureDaemonPatrolConfig(ctx.TownRoot)
 }
 
 // PatrolNotStuckCheck detects wisps that have been in_progress too long.
@@ -230,19 +221,41 @@ type PatrolNotStuckCheck struct {
 	stuckThreshold time.Duration
 }
 
+// DefaultStuckThreshold is the fallback when no role bead config exists.
+// Per ZFC: "Let agents decide thresholds. 'Stuck' is a judgment call."
+const DefaultStuckThreshold = 1 * time.Hour
+
 // NewPatrolNotStuckCheck creates a new patrol not stuck check.
 func NewPatrolNotStuckCheck() *PatrolNotStuckCheck {
 	return &PatrolNotStuckCheck{
 		BaseCheck: BaseCheck{
 			CheckName:        "patrol-not-stuck",
 			CheckDescription: "Check for stuck patrol wisps (>1h in_progress)",
+			CheckCategory:    CategoryPatrol,
 		},
-		stuckThreshold: 1 * time.Hour,
+		stuckThreshold: DefaultStuckThreshold,
 	}
+}
+
+// loadStuckThreshold loads the stuck threshold from the Deacon's role bead.
+// Returns the default if no config exists.
+func loadStuckThreshold(townRoot string) time.Duration {
+	bd := beads.NewWithBeadsDir(townRoot, beads.ResolveBeadsDir(townRoot))
+	roleConfig, err := bd.GetRoleConfig(beads.RoleBeadIDTown("deacon"))
+	if err != nil || roleConfig == nil || roleConfig.StuckThreshold == "" {
+		return DefaultStuckThreshold
+	}
+	if d, err := time.ParseDuration(roleConfig.StuckThreshold); err == nil {
+		return d
+	}
+	return DefaultStuckThreshold
 }
 
 // Run checks for stuck patrol wisps.
 func (c *PatrolNotStuckCheck) Run(ctx *CheckContext) *CheckResult {
+	// Load threshold from role bead (ZFC: agent-controlled)
+	c.stuckThreshold = loadStuckThreshold(ctx.TownRoot)
+
 	rigs, err := discoverRigs(ctx.TownRoot)
 	if err != nil {
 		return &CheckResult{
@@ -272,11 +285,12 @@ func (c *PatrolNotStuckCheck) Run(ctx *CheckContext) *CheckResult {
 		stuckWisps = append(stuckWisps, stuck...)
 	}
 
+	thresholdStr := c.stuckThreshold.String()
 	if len(stuckWisps) > 0 {
 		return &CheckResult{
 			Name:    c.Name(),
 			Status:  StatusWarning,
-			Message: fmt.Sprintf("%d stuck patrol wisp(s) found (>1h)", len(stuckWisps)),
+			Message: fmt.Sprintf("%d stuck patrol wisp(s) found (>%s)", len(stuckWisps), thresholdStr),
 			Details: stuckWisps,
 			FixHint: "Manual review required - wisps may need to be burned or sessions restarted",
 		}
@@ -340,6 +354,7 @@ func NewPatrolPluginsAccessibleCheck() *PatrolPluginsAccessibleCheck {
 			BaseCheck: BaseCheck{
 				CheckName:        "patrol-plugins-accessible",
 				CheckDescription: "Check if plugin directories exist and are readable",
+				CheckCategory:    CategoryPatrol,
 			},
 		},
 	}
@@ -409,6 +424,7 @@ func NewPatrolRolesHavePromptsCheck() *PatrolRolesHavePromptsCheck {
 			BaseCheck: BaseCheck{
 				CheckName:        "patrol-roles-have-prompts",
 				CheckDescription: "Check if internal/templates/roles/*.md.tmpl exist for each patrol role",
+				CheckCategory:    CategoryPatrol,
 			},
 		},
 	}

@@ -1,4 +1,4 @@
-.PHONY: build install clean test
+.PHONY: build install clean test generate
 
 BINARY := gt
 BUILD_DIR := .
@@ -12,7 +12,10 @@ LDFLAGS := -X github.com/steveyegge/gastown/internal/cmd.Version=$(VERSION) \
            -X github.com/steveyegge/gastown/internal/cmd.Commit=$(COMMIT) \
            -X github.com/steveyegge/gastown/internal/cmd.BuildTime=$(BUILD_TIME)
 
-build:
+generate:
+	go generate ./...
+
+build: generate
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/gt
 ifeq ($(shell uname),Darwin)
 	@codesign -s - -f $(BUILD_DIR)/$(BINARY) 2>/dev/null || true
@@ -20,7 +23,10 @@ ifeq ($(shell uname),Darwin)
 endif
 
 install: build
-	cp $(BUILD_DIR)/$(BINARY) ~/bin/$(BINARY)
+	cp $(BUILD_DIR)/$(BINARY) ~/.local/bin/$(BINARY)
+ifeq ($(shell uname),Darwin)
+	@codesign -s - -f ~/.local/bin/$(BINARY) 2>/dev/null || true
+endif
 
 clean:
 	rm -f $(BUILD_DIR)/$(BINARY)

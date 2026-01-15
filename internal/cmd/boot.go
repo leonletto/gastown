@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	bootStatusJSON bool
-	bootDegraded   bool
+	bootStatusJSON    bool
+	bootDegraded      bool
+	bootAgentOverride string
 )
 
 var bootCmd = &cobra.Command{
@@ -36,7 +37,7 @@ Boot lifecycle:
   4. Boot exits (or handoffs in non-degraded mode)
 
 Location: ~/gt/deacon/dogs/boot/
-Session: gt-deacon-boot`,
+Session: gt-boot`,
 }
 
 var bootStatusCmd = &cobra.Command{
@@ -84,6 +85,7 @@ Use --degraded flag when running in degraded mode.`,
 func init() {
 	bootStatusCmd.Flags().BoolVar(&bootStatusJSON, "json", false, "Output as JSON")
 	bootTriageCmd.Flags().BoolVar(&bootDegraded, "degraded", false, "Run in degraded mode (no tmux)")
+	bootSpawnCmd.Flags().StringVar(&bootAgentOverride, "agent", "", "Agent alias to run Boot with (overrides town default)")
 
 	bootCmd.AddCommand(bootStatusCmd)
 	bootCmd.AddCommand(bootSpawnCmd)
@@ -206,7 +208,7 @@ func runBootSpawn(cmd *cobra.Command, args []string) error {
 	}
 
 	// Spawn Boot
-	if err := b.Spawn(); err != nil {
+	if err := b.Spawn(bootAgentOverride); err != nil {
 		status.Error = err.Error()
 		status.CompletedAt = time.Now()
 		status.Running = false
@@ -277,7 +279,7 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 	tm := b.Tmux()
 
 	// Check if Deacon session exists
-	deaconSession := "gt-deacon"
+	deaconSession := getDeaconSessionName()
 	hasDeacon, err := tm.HasSession(deaconSession)
 	if err != nil {
 		return "error", "deacon", fmt.Errorf("checking deacon session: %w", err)

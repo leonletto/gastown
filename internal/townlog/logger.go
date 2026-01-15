@@ -36,6 +36,10 @@ const (
 	EventPolecatNudged  EventType = "polecat_nudged"
 	EventEscalationSent EventType = "escalation_sent"
 	EventPatrolComplete EventType = "patrol_complete"
+
+	// Session death events (for crash investigation)
+	EventSessionDeath EventType = "session_death" // Session terminated (with reason)
+	EventMassDeath    EventType = "mass_death"    // Multiple sessions died in short window
 )
 
 // Event represents a single agent lifecycle event.
@@ -80,7 +84,7 @@ func (l *Logger) LogEvent(event Event) error {
 	}
 
 	// Open file for appending
-	f, err := os.OpenFile(l.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(l.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return fmt.Errorf("opening log file: %w", err)
 	}
@@ -188,6 +192,18 @@ func formatLogLine(e Event) string {
 		} else {
 			detail = "patrol complete"
 		}
+	case EventSessionDeath:
+		if e.Context != "" {
+			detail = fmt.Sprintf("session terminated (%s)", e.Context)
+		} else {
+			detail = "session terminated"
+		}
+	case EventMassDeath:
+		if e.Context != "" {
+			detail = fmt.Sprintf("MASS SESSION DEATH (%s)", e.Context)
+		} else {
+			detail = "MASS SESSION DEATH"
+		}
 	default:
 		detail = string(e.Type)
 		if e.Context != "" {
@@ -211,7 +227,7 @@ func truncate(s string, maxLen int) string {
 func ReadEvents(townRoot string) ([]Event, error) {
 	path := logPath(townRoot)
 
-	content, err := os.ReadFile(path)
+	content, err := os.ReadFile(path) //nolint:gosec // G304: path is constructed from trusted townRoot
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil // No log file yet

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/crew"
 	"github.com/steveyegge/gastown/internal/git"
@@ -121,7 +122,7 @@ func detectCrewFromCwd() (*crewDetection, error) {
 	// Look for pattern: <rig>/crew/<name>/...
 	// Minimum: rig, crew, name = 3 parts
 	if len(parts) < 3 {
-		return nil, fmt.Errorf("not in a crew workspace (path too short)")
+		return nil, fmt.Errorf("not inside a crew workspace - specify the crew name or cd into a crew directory (e.g., gastown/crew/max)")
 	}
 
 	rigName := parts[0]
@@ -136,7 +137,7 @@ func detectCrewFromCwd() (*crewDetection, error) {
 	}, nil
 }
 
-// isShellCommand checks if the command is a shell (meaning Claude has exited).
+// isShellCommand checks if the command is a shell (meaning the runtime has exited).
 func isShellCommand(cmd string) bool {
 	shells := constants.SupportedShells
 	for _, shell := range shells {
@@ -147,21 +148,49 @@ func isShellCommand(cmd string) bool {
 	return false
 }
 
-// execClaude execs claude, replacing the current process.
-// Used when we're already in the target session and just need to start Claude.
-// If prompt is provided, it's passed as the initial prompt to Claude.
-func execClaude(prompt string) error {
-	claudePath, err := exec.LookPath("claude")
-	if err != nil {
-		return fmt.Errorf("claude not found: %w", err)
+// execAgent execs the configured agent, replacing the current process.
+// Used when we're already in the target session and just need to start the agent.
+// If prompt is provided, it's passed as the initial prompt.
+func execAgent(cfg *config.RuntimeConfig, prompt string) error {
+	if cfg == nil {
+		cfg = config.DefaultRuntimeConfig()
 	}
 
-	// exec replaces current process with claude
-	args := []string{"claude", "--dangerously-skip-permissions"}
+	agentPath, err := exec.LookPath(cfg.Command)
+	if err != nil {
+		return fmt.Errorf("%s not found: %w", cfg.Command, err)
+	}
+
+	// exec replaces current process with agent
+	// args[0] must be the command name (convention for exec)
+	args := append([]string{cfg.Command}, cfg.Args...)
 	if prompt != "" {
 		args = append(args, prompt)
 	}
-	return syscall.Exec(claudePath, args, os.Environ())
+	return syscall.Exec(agentPath, args, os.Environ())
+}
+
+// execRuntime execs the runtime CLI, replacing the current process.
+// Used when we're already in the target session and just need to start the runtime.
+// If prompt is provided, it's passed according to the runtime's prompt mode.
+func execRuntime(prompt, rigPath, configDir string) error {
+	runtimeConfig := config.LoadRuntimeConfig(rigPath)
+	args := runtimeConfig.BuildArgsWithPrompt(prompt)
+	if len(args) == 0 {
+		return fmt.Errorf("runtime command not configured")
+	}
+
+	binPath, err := exec.LookPath(args[0])
+	if err != nil {
+		return fmt.Errorf("runtime command not found: %w", err)
+	}
+
+	env := os.Environ()
+	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && configDir != "" {
+		env = append(env, fmt.Sprintf("%s=%s", runtimeConfig.Session.ConfigDirEnv, configDir))
+	}
+
+	return syscall.Exec(binPath, args, env)
 }
 
 // isInTmuxSession checks if we're currently inside the target tmux session.
@@ -199,10 +228,11 @@ func attachToTmuxSession(sessionID string) error {
 	return cmd.Run()
 }
 
-// ensureMainBranch checks if a git directory is on main branch.
+// ensureDefaultBranch checks if a git directory is on the default branch.
 // If not, warns the user and offers to switch.
-// Returns true if on main (or switched to main), false if user declined.
-func ensureMainBranch(dir, roleName string) bool {
+// Returns true if on default branch (or switched to it), false if user declined.
+// The rigPath parameter is used to look up the configured default branch.
+func ensureDefaultBranch(dir, roleName, rigPath string) bool { //nolint:unparam // bool return kept for future callers to check
 	g := git.NewGit(dir)
 
 	branch, err := g.CurrentBranch()
@@ -211,31 +241,38 @@ func ensureMainBranch(dir, roleName string) bool {
 		return true
 	}
 
-	if branch == "main" || branch == "master" {
+	// Get configured default branch for this rig
+	defaultBranch := "main" // fallback
+	if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+
+	if branch == defaultBranch || branch == "master" {
 		return true
 	}
 
 	// Warn about wrong branch
-	fmt.Printf("\n%s %s is on branch '%s', not main\n",
+	fmt.Printf("\n%s %s is on branch '%s', not %s\n",
 		style.Warning.Render("⚠"),
 		roleName,
-		branch)
-	fmt.Println("  Persistent roles should work on main to avoid orphaned work.")
+		branch,
+		defaultBranch)
+	fmt.Printf("  Persistent roles should work on %s to avoid orphaned work.\n", defaultBranch)
 	fmt.Println()
 
-	// Auto-switch to main
-	fmt.Printf("  Switching to main...\n")
-	if err := g.Checkout("main"); err != nil {
-		fmt.Printf("  %s Could not switch to main: %v\n", style.Error.Render("✗"), err)
-		fmt.Println("  Please manually run: git checkout main && git pull")
+	// Auto-switch to default branch
+	fmt.Printf("  Switching to %s...\n", defaultBranch)
+	if err := g.Checkout(defaultBranch); err != nil {
+		fmt.Printf("  %s Could not switch to %s: %v\n", style.Error.Render("✗"), defaultBranch, err)
+		fmt.Printf("  Please manually run: git checkout %s && git pull\n", defaultBranch)
 		return false
 	}
 
 	// Pull latest
-	if err := g.Pull("origin", "main"); err != nil {
+	if err := g.Pull("origin", defaultBranch); err != nil {
 		fmt.Printf("  %s Pull failed (continuing anyway): %v\n", style.Warning.Render("⚠"), err)
 	} else {
-		fmt.Printf("  %s Switched to main and pulled latest\n", style.Success.Render("✓"))
+		fmt.Printf("  %s Switched to %s and pulled latest\n", style.Success.Render("✓"), defaultBranch)
 	}
 
 	return true
@@ -271,7 +308,7 @@ func parseCrewSessionName(sessionName string) (rigName, crewName string, ok bool
 
 // findRigCrewSessions returns all crew sessions for a given rig, sorted alphabetically.
 // Uses tmux list-sessions to find sessions matching gt-<rig>-crew-* pattern.
-func findRigCrewSessions(rigName string) ([]string, error) {
+func findRigCrewSessions(rigName string) ([]string, error) { //nolint:unparam // error return kept for future use
 	cmd := exec.Command("tmux", "list-sessions", "-F", "#{session_name}")
 	out, err := cmd.Output()
 	if err != nil {

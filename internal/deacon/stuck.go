@@ -8,13 +8,17 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // Default parameters for stuck-session detection.
+// These are fallbacks when no role bead config exists.
+// Per ZFC: "Let agents decide thresholds. 'Stuck' is a judgment call."
 const (
-	DefaultPingTimeout        = 30 * time.Second // How long to wait for response
-	DefaultConsecutiveFailures = 3               // Failures before force-kill
-	DefaultCooldown           = 5 * time.Minute  // Minimum time between force-kills
+	DefaultPingTimeout         = 30 * time.Second // How long to wait for response
+	DefaultConsecutiveFailures = 3                // Failures before force-kill
+	DefaultCooldown            = 5 * time.Minute  // Minimum time between force-kills
 )
 
 // StuckConfig holds configurable parameters for stuck-session detection.
@@ -31,6 +35,37 @@ func DefaultStuckConfig() *StuckConfig {
 		ConsecutiveFailures: DefaultConsecutiveFailures,
 		Cooldown:            DefaultCooldown,
 	}
+}
+
+// LoadStuckConfig loads stuck detection config from the Deacon's role bead.
+// Returns defaults if no role bead exists or if fields aren't configured.
+// Per ZFC: agents control their own thresholds via their role beads.
+func LoadStuckConfig(townRoot string) *StuckConfig {
+	config := DefaultStuckConfig()
+
+	// Load from hq-deacon-role bead
+	bd := beads.NewWithBeadsDir(townRoot, beads.ResolveBeadsDir(townRoot))
+	roleConfig, err := bd.GetRoleConfig(beads.RoleBeadIDTown("deacon"))
+	if err != nil || roleConfig == nil {
+		return config
+	}
+
+	// Override defaults with role bead values
+	if roleConfig.PingTimeout != "" {
+		if d, err := time.ParseDuration(roleConfig.PingTimeout); err == nil {
+			config.PingTimeout = d
+		}
+	}
+	if roleConfig.ConsecutiveFailures > 0 {
+		config.ConsecutiveFailures = roleConfig.ConsecutiveFailures
+	}
+	if roleConfig.KillCooldown != "" {
+		if d, err := time.ParseDuration(roleConfig.KillCooldown); err == nil {
+			config.Cooldown = d
+		}
+	}
+
+	return config
 }
 
 // AgentHealthState tracks the health check state for a single agent.
@@ -73,7 +108,7 @@ func HealthCheckStateFile(townRoot string) string {
 func LoadHealthCheckState(townRoot string) (*HealthCheckState, error) {
 	stateFile := HealthCheckStateFile(townRoot)
 
-	data, err := os.ReadFile(stateFile)
+	data, err := os.ReadFile(stateFile) //nolint:gosec // G304: path is constructed from trusted townRoot
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Return empty state
@@ -112,7 +147,7 @@ func SaveHealthCheckState(townRoot string, state *HealthCheckState) error {
 		return fmt.Errorf("marshaling health check state: %w", err)
 	}
 
-	return os.WriteFile(stateFile, data, 0644)
+	return os.WriteFile(stateFile, data, 0600)
 }
 
 // GetAgentState returns the health state for an agent, creating if needed.

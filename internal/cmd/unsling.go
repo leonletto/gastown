@@ -75,8 +75,7 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 	var agentID string
 	var err error
 	if targetAgent != "" {
-		// Skip pane lookup - unsling only needs agent ID, not tmux session
-		agentID, _, _, err = resolveTargetAgent(targetAgent, true)
+		agentID, _, _, err = resolveTargetAgent(targetAgent)
 		if err != nil {
 			return fmt.Errorf("resolving target agent: %w", err)
 		}
@@ -106,7 +105,7 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 	b := beads.New(beadsPath)
 
 	// Convert agent ID to agent bead ID and look up the agent bead
-	agentBeadID := agentIDToBeadID(agentID)
+	agentBeadID := agentIDToBeadID(agentID, townRoot)
 	if agentBeadID == "" {
 		return fmt.Errorf("could not convert agent ID %s to bead ID", agentID)
 	}
@@ -162,9 +161,8 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Clear the hook by updating agent bead with empty hook_bead
-	emptyHook := ""
-	if err := b.UpdateAgentState(agentBeadID, "running", &emptyHook); err != nil {
+	// Clear the hook (gt-zecmc: removed agent_state update - observable from tmux)
+	if err := b.ClearHookBead(agentBeadID); err != nil {
 		return fmt.Errorf("clearing hook from agent bead %s: %w", agentBeadID, err)
 	}
 

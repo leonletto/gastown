@@ -15,7 +15,7 @@ import (
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
-	"github.com/steveyegge/gastown/internal/session"
+	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -59,15 +59,19 @@ Examples:
 }
 
 var polecatAddCmd = &cobra.Command{
-	Use:   "add <rig> <name>",
-	Short: "Add a new polecat to a rig",
+	Use:        "add <rig> <name>",
+	Short:      "Add a new polecat to a rig (DEPRECATED)",
+	Deprecated: "use 'gt polecat identity add' instead. This command will be removed in v1.0.",
 	Long: `Add a new polecat to a rig.
+
+DEPRECATED: Use 'gt polecat identity add' instead. This command will be removed in v1.0.
 
 Creates a polecat directory, clones the rig repo, creates a work branch,
 and initializes state.
 
 Example:
-  gt polecat add greenplace Toast`,
+  gt polecat identity add greenplace Toast  # Preferred
+  gt polecat add greenplace Toast           # Deprecated`,
 	Args: cobra.ExactArgs(2),
 	RunE: runPolecatAdd,
 }
@@ -88,72 +92,6 @@ Examples:
   gt polecat remove greenplace --all --force`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runPolecatRemove,
-}
-
-var polecatWakeCmd = &cobra.Command{
-	Use:   "wake <rig>/<polecat>",
-	Short: "(Deprecated) Resume a polecat to working state",
-	Long: `Resume a polecat to working state.
-
-DEPRECATED: In the transient model, polecats are created fresh for each task
-via 'gt sling'. This command is kept for backward compatibility.
-
-Transitions: done → working
-
-Example:
-  gt polecat wake greenplace/Toast`,
-	Args: cobra.ExactArgs(1),
-	RunE: runPolecatWake,
-}
-
-var polecatSleepCmd = &cobra.Command{
-	Use:   "sleep <rig>/<polecat>",
-	Short: "(Deprecated) Mark polecat as done",
-	Long: `Mark polecat as done.
-
-DEPRECATED: In the transient model, polecats use 'gt handoff' when complete,
-which triggers automatic cleanup by the Witness. This command is kept for
-backward compatibility.
-
-Transitions: working → done
-
-Example:
-  gt polecat sleep greenplace/Toast`,
-	Args: cobra.ExactArgs(1),
-	RunE: runPolecatSleep,
-}
-
-var polecatDoneCmd = &cobra.Command{
-	Use:     "done <rig>/<polecat>",
-	Aliases: []string{"finish"},
-	Short:   "Mark polecat as done with work and return to idle",
-	Long: `Mark polecat as done with work and return to idle.
-
-Transitions: working/done/stuck → idle
-Clears the assigned issue.
-Fails if session is running (stop first).
-
-Example:
-  gt polecat done greenplace/Toast
-  gt polecat finish greenplace/Toast`,
-	Args: cobra.ExactArgs(1),
-	RunE: runPolecatDone,
-}
-
-var polecatResetCmd = &cobra.Command{
-	Use:   "reset <rig>/<polecat>",
-	Short: "Force reset polecat to idle state",
-	Long: `Force reset polecat to idle state.
-
-Transitions: any state → idle
-Clears the assigned issue.
-Use when polecat is stuck in an unexpected state.
-Fails if session is running (stop first).
-
-Example:
-  gt polecat reset greenplace/Toast`,
-	Args: cobra.ExactArgs(1),
-	RunE: runPolecatReset,
 }
 
 var polecatSyncCmd = &cobra.Command{
@@ -195,15 +133,15 @@ Examples:
 }
 
 var (
-	polecatSyncAll      bool
-	polecatSyncFromMain bool
-	polecatStatusJSON   bool
-	polecatGitStateJSON bool
-	polecatGCDryRun           bool
-	polecatNukeAll            bool
-	polecatNukeDryRun         bool
-	polecatNukeForce          bool
-	polecatCheckRecoveryJSON  bool
+	polecatSyncAll           bool
+	polecatSyncFromMain      bool
+	polecatStatusJSON        bool
+	polecatGitStateJSON      bool
+	polecatGCDryRun          bool
+	polecatNukeAll           bool
+	polecatNukeDryRun        bool
+	polecatNukeForce         bool
+	polecatCheckRecoveryJSON bool
 )
 
 var polecatGCCmd = &cobra.Command{
@@ -212,8 +150,8 @@ var polecatGCCmd = &cobra.Command{
 	Long: `Garbage collect stale polecat branches in a rig.
 
 Polecats use unique timestamped branches (polecat/<name>-<timestamp>) to
-prevent drift issues. Over time, these branches accumulate as polecats
-are recreated.
+prevent drift issues. Over time, these branches accumulate when stale
+polecats are repaired.
 
 This command removes orphaned branches:
   - Branches for polecats that no longer exist
@@ -294,6 +232,37 @@ Examples:
 	RunE: runPolecatCheckRecovery,
 }
 
+var (
+	polecatStaleJSON      bool
+	polecatStaleThreshold int
+	polecatStaleCleanup   bool
+)
+
+var polecatStaleCmd = &cobra.Command{
+	Use:   "stale <rig>",
+	Short: "Detect stale polecats that may need cleanup",
+	Long: `Detect stale polecats in a rig that are candidates for cleanup.
+
+A polecat is considered stale if:
+  - No active tmux session
+  - Way behind main (>threshold commits) OR no agent bead
+  - Has no uncommitted work that could be lost
+
+The default threshold is 20 commits behind main.
+
+Use --cleanup to automatically nuke stale polecats that are safe to remove.
+Use --dry-run with --cleanup to see what would be cleaned.
+
+Examples:
+  gt polecat stale greenplace
+  gt polecat stale greenplace --threshold 50
+  gt polecat stale greenplace --json
+  gt polecat stale greenplace --cleanup
+  gt polecat stale greenplace --cleanup --dry-run`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPolecatStale,
+}
+
 func init() {
 	// List flags
 	polecatListCmd.Flags().BoolVar(&polecatListJSON, "json", false, "Output as JSON")
@@ -324,20 +293,22 @@ func init() {
 	// Check-recovery flags
 	polecatCheckRecoveryCmd.Flags().BoolVar(&polecatCheckRecoveryJSON, "json", false, "Output as JSON")
 
+	// Stale flags
+	polecatStaleCmd.Flags().BoolVar(&polecatStaleJSON, "json", false, "Output as JSON")
+	polecatStaleCmd.Flags().IntVar(&polecatStaleThreshold, "threshold", 20, "Commits behind main to consider stale")
+	polecatStaleCmd.Flags().BoolVar(&polecatStaleCleanup, "cleanup", false, "Automatically nuke stale polecats")
+
 	// Add subcommands
 	polecatCmd.AddCommand(polecatListCmd)
 	polecatCmd.AddCommand(polecatAddCmd)
 	polecatCmd.AddCommand(polecatRemoveCmd)
-	polecatCmd.AddCommand(polecatWakeCmd)
-	polecatCmd.AddCommand(polecatSleepCmd)
-	polecatCmd.AddCommand(polecatDoneCmd)
-	polecatCmd.AddCommand(polecatResetCmd)
 	polecatCmd.AddCommand(polecatSyncCmd)
 	polecatCmd.AddCommand(polecatStatusCmd)
 	polecatCmd.AddCommand(polecatGitStateCmd)
 	polecatCmd.AddCommand(polecatCheckRecoveryCmd)
 	polecatCmd.AddCommand(polecatGCCmd)
 	polecatCmd.AddCommand(polecatNukeCmd)
+	polecatCmd.AddCommand(polecatStaleCmd)
 
 	rootCmd.AddCommand(polecatCmd)
 }
@@ -359,7 +330,8 @@ func getPolecatManager(rigName string) (*polecat.Manager, *rig.Rig, error) {
 	}
 
 	polecatGit := git.NewGit(r.Path)
-	mgr := polecat.NewManager(r, polecatGit)
+	t := tmux.NewTmux()
+	mgr := polecat.NewManager(r, polecatGit, t)
 
 	return mgr, r, nil
 }
@@ -392,8 +364,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 
 	for _, r := range rigs {
 		polecatGit := git.NewGit(r.Path)
-		mgr := polecat.NewManager(r, polecatGit)
-		sessMgr := session.NewManager(t, r)
+		mgr := polecat.NewManager(r, polecatGit, t)
+		polecatMgr := polecat.NewSessionManager(t, r)
 
 		polecats, err := mgr.List()
 		if err != nil {
@@ -402,7 +374,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 		}
 
 		for _, p := range polecats {
-			running, _ := sessMgr.IsRunning(p.Name)
+			running, _ := polecatMgr.IsRunning(p.Name)
 			allPolecats = append(allPolecats, PolecatListItem{
 				Rig:            r.Name,
 				Name:           p.Name,
@@ -459,6 +431,11 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 }
 
 func runPolecatAdd(cmd *cobra.Command, args []string) error {
+	// Emit deprecation warning
+	fmt.Fprintf(os.Stderr, "%s 'gt polecat add' is deprecated. Use 'gt polecat identity add' instead.\n",
+		style.Warning.Render("Warning:"))
+	fmt.Fprintf(os.Stderr, "         This command will be removed in v1.0.\n\n")
+
 	rigName := args[0]
 	polecatName := args[1]
 
@@ -482,71 +459,14 @@ func runPolecatAdd(cmd *cobra.Command, args []string) error {
 }
 
 func runPolecatRemove(cmd *cobra.Command, args []string) error {
-	// Build list of polecats to remove
-	type polecatToRemove struct {
-		rigName     string
-		polecatName string
-		mgr         *polecat.Manager
-		r           *rig.Rig
+	targets, err := resolvePolecatTargets(args, polecatRemoveAll)
+	if err != nil {
+		return err
 	}
-	var toRemove []polecatToRemove
 
-	if polecatRemoveAll {
-		// --all flag: first arg is just the rig name
-		rigName := args[0]
-		// Check if it looks like rig/polecat format
-		if _, _, err := parseAddress(rigName); err == nil {
-			return fmt.Errorf("with --all, provide just the rig name (e.g., 'gt polecat remove greenplace --all')")
-		}
-
-		mgr, r, err := getPolecatManager(rigName)
-		if err != nil {
-			return err
-		}
-
-		polecats, err := mgr.List()
-		if err != nil {
-			return fmt.Errorf("listing polecats: %w", err)
-		}
-
-		if len(polecats) == 0 {
-			fmt.Println("No polecats to remove.")
-			return nil
-		}
-
-		for _, p := range polecats {
-			toRemove = append(toRemove, polecatToRemove{
-				rigName:     rigName,
-				polecatName: p.Name,
-				mgr:         mgr,
-				r:           r,
-			})
-		}
-	} else {
-		// Multiple rig/polecat arguments - require explicit rig/polecat format
-		for _, arg := range args {
-			// Validate format: must contain "/" to avoid misinterpreting rig names as polecat names
-			if !strings.Contains(arg, "/") {
-				return fmt.Errorf("invalid address '%s': must be in 'rig/polecat' format (e.g., 'gastown/Toast')", arg)
-			}
-
-			rigName, polecatName, err := parseAddress(arg)
-			if err != nil {
-				return fmt.Errorf("invalid address '%s': %w", arg, err)
-			}
-
-			mgr, r, err := getPolecatManager(rigName)
-			if err != nil {
-				return err
-			}
-
-			toRemove = append(toRemove, polecatToRemove{
-				rigName:     rigName,
-				polecatName: polecatName,
-				mgr:         mgr,
-				r:           r,
-			})
-		}
+	if len(targets) == 0 {
+		fmt.Println("No polecats to remove.")
+		return nil
 	}
 
 	// Remove each polecat
@@ -554,11 +474,11 @@ func runPolecatRemove(cmd *cobra.Command, args []string) error {
 	var removeErrors []string
 	removed := 0
 
-	for _, p := range toRemove {
+	for _, p := range targets {
 		// Check if session is running
 		if !polecatForce {
-			sessMgr := session.NewManager(t, p.r)
-			running, _ := sessMgr.IsRunning(p.polecatName)
+			polecatMgr := polecat.NewSessionManager(t, p.r)
+			running, _ := polecatMgr.IsRunning(p.polecatName)
 			if running {
 				removeErrors = append(removeErrors, fmt.Sprintf("%s/%s: session is running (stop first or use --force)", p.rigName, p.polecatName))
 				continue
@@ -599,112 +519,6 @@ func runPolecatRemove(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runPolecatWake(cmd *cobra.Command, args []string) error {
-	fmt.Println(style.Warning.Render("DEPRECATED: Use 'gt sling' to create fresh polecats instead"))
-	fmt.Println()
-
-	rigName, polecatName, err := parseAddress(args[0])
-	if err != nil {
-		return err
-	}
-
-	mgr, _, err := getPolecatManager(rigName)
-	if err != nil {
-		return err
-	}
-
-	if err := mgr.Wake(polecatName); err != nil {
-		return fmt.Errorf("waking polecat: %w", err)
-	}
-
-	fmt.Printf("%s Polecat %s is now working.\n", style.SuccessPrefix, polecatName)
-	return nil
-}
-
-func runPolecatSleep(cmd *cobra.Command, args []string) error {
-	fmt.Println(style.Warning.Render("DEPRECATED: Use 'gt handoff' from within a polecat session instead"))
-	fmt.Println()
-
-	rigName, polecatName, err := parseAddress(args[0])
-	if err != nil {
-		return err
-	}
-
-	mgr, r, err := getPolecatManager(rigName)
-	if err != nil {
-		return err
-	}
-
-	// Check if session is running
-	t := tmux.NewTmux()
-	sessMgr := session.NewManager(t, r)
-	running, _ := sessMgr.IsRunning(polecatName)
-	if running {
-		return fmt.Errorf("session is running. Use 'gt handoff' from the polecat session, or stop it with: gt session stop %s/%s", rigName, polecatName)
-	}
-
-	if err := mgr.Sleep(polecatName); err != nil {
-		return fmt.Errorf("marking polecat as done: %w", err)
-	}
-
-	fmt.Printf("%s Polecat %s is now done.\n", style.SuccessPrefix, polecatName)
-	return nil
-}
-
-func runPolecatDone(cmd *cobra.Command, args []string) error {
-	rigName, polecatName, err := parseAddress(args[0])
-	if err != nil {
-		return err
-	}
-
-	mgr, r, err := getPolecatManager(rigName)
-	if err != nil {
-		return err
-	}
-
-	// Check if session is running
-	t := tmux.NewTmux()
-	sessMgr := session.NewManager(t, r)
-	running, _ := sessMgr.IsRunning(polecatName)
-	if running {
-		return fmt.Errorf("session is running. Stop it first with: gt session stop %s/%s", rigName, polecatName)
-	}
-
-	if err := mgr.Finish(polecatName); err != nil {
-		return fmt.Errorf("finishing polecat: %w", err)
-	}
-
-	fmt.Printf("%s Polecat %s is now idle.\n", style.SuccessPrefix, polecatName)
-	return nil
-}
-
-func runPolecatReset(cmd *cobra.Command, args []string) error {
-	rigName, polecatName, err := parseAddress(args[0])
-	if err != nil {
-		return err
-	}
-
-	mgr, r, err := getPolecatManager(rigName)
-	if err != nil {
-		return err
-	}
-
-	// Check if session is running
-	t := tmux.NewTmux()
-	sessMgr := session.NewManager(t, r)
-	running, _ := sessMgr.IsRunning(polecatName)
-	if running {
-		return fmt.Errorf("session is running. Stop it first with: gt session stop %s/%s", rigName, polecatName)
-	}
-
-	if err := mgr.Reset(polecatName); err != nil {
-		return fmt.Errorf("resetting polecat: %w", err)
-	}
-
-	fmt.Printf("%s Polecat %s has been reset to idle.\n", style.SuccessPrefix, polecatName)
-	return nil
-}
-
 func runPolecatSync(cmd *cobra.Command, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("rig or rig/polecat address required")
@@ -718,7 +532,7 @@ func runPolecatSync(cmd *cobra.Command, args []string) error {
 		polecatName = ""
 	}
 
-	mgr, r, err := getPolecatManager(rigName)
+	mgr, _, err := getPolecatManager(rigName)
 	if err != nil {
 		return err
 	}
@@ -745,10 +559,15 @@ func runPolecatSync(cmd *cobra.Command, args []string) error {
 	// Sync each polecat
 	var syncErrors []string
 	for _, name := range polecatsToSync {
-		polecatDir := filepath.Join(r.Path, "polecats", name)
+		// Get polecat to get correct clone path (handles old vs new structure)
+		p, err := mgr.Get(name)
+		if err != nil {
+			syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
 
 		// Check directory exists
-		if _, err := os.Stat(polecatDir); os.IsNotExist(err) {
+		if _, err := os.Stat(p.ClonePath); os.IsNotExist(err) {
 			syncErrors = append(syncErrors, fmt.Sprintf("%s: directory not found", name))
 			continue
 		}
@@ -762,7 +581,7 @@ func runPolecatSync(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Syncing %s/%s...\n", rigName, name)
 
 		syncCmd := exec.Command("bd", syncArgs...)
-		syncCmd.Dir = polecatDir
+		syncCmd.Dir = p.ClonePath
 		output, err := syncCmd.CombinedOutput()
 		if err != nil {
 			syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", name, err))
@@ -820,11 +639,11 @@ func runPolecatStatus(cmd *cobra.Command, args []string) error {
 
 	// Get session info
 	t := tmux.NewTmux()
-	sessMgr := session.NewManager(t, r)
-	sessInfo, err := sessMgr.Status(polecatName)
+	polecatMgr := polecat.NewSessionManager(t, r)
+	sessInfo, err := polecatMgr.Status(polecatName)
 	if err != nil {
 		// Non-fatal - continue without session info
-		sessInfo = &session.Info{
+		sessInfo = &polecat.SessionInfo{
 			Polecat: polecatName,
 			Running: false,
 		}
@@ -1108,13 +927,13 @@ func getGitState(worktreePath string) (*GitState, error) {
 
 // RecoveryStatus represents whether a polecat needs recovery or is safe to nuke.
 type RecoveryStatus struct {
-	Rig           string `json:"rig"`
-	Polecat       string `json:"polecat"`
-	CleanupStatus string `json:"cleanup_status"`
-	NeedsRecovery bool   `json:"needs_recovery"`
-	Verdict       string `json:"verdict"` // SAFE_TO_NUKE or NEEDS_RECOVERY
-	Branch        string `json:"branch,omitempty"`
-	Issue         string `json:"issue,omitempty"`
+	Rig           string                `json:"rig"`
+	Polecat       string                `json:"polecat"`
+	CleanupStatus polecat.CleanupStatus `json:"cleanup_status"`
+	NeedsRecovery bool                  `json:"needs_recovery"`
+	Verdict       string                `json:"verdict"` // SAFE_TO_NUKE or NEEDS_RECOVERY
+	Branch        string                `json:"branch,omitempty"`
+	Issue         string                `json:"issue,omitempty"`
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1153,38 +972,35 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		// This handles polecats that haven't self-reported yet
 		gitState, gitErr := getGitState(p.ClonePath)
 		if gitErr != nil {
-			status.CleanupStatus = "unknown"
+			status.CleanupStatus = polecat.CleanupUnknown
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
 		} else if gitState.Clean {
-			status.CleanupStatus = "clean"
+			status.CleanupStatus = polecat.CleanupClean
 			status.NeedsRecovery = false
 			status.Verdict = "SAFE_TO_NUKE"
 		} else if gitState.UnpushedCommits > 0 {
-			status.CleanupStatus = "has_unpushed"
+			status.CleanupStatus = polecat.CleanupUnpushed
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
 		} else if gitState.StashCount > 0 {
-			status.CleanupStatus = "has_stash"
+			status.CleanupStatus = polecat.CleanupStash
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
 		} else {
-			status.CleanupStatus = "has_uncommitted"
+			status.CleanupStatus = polecat.CleanupUncommitted
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
 		}
 	} else {
 		// Use cleanup_status from agent bead
-		status.CleanupStatus = fields.CleanupStatus
-		switch fields.CleanupStatus {
-		case "clean":
+		status.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
+		if status.CleanupStatus.IsSafe() {
 			status.NeedsRecovery = false
 			status.Verdict = "SAFE_TO_NUKE"
-		case "has_uncommitted", "has_unpushed", "has_stash":
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
-		default:
-			// Unknown or empty - be conservative
+		} else {
+			// RequiresRecovery covers uncommitted, stash, unpushed
+			// Unknown/empty also treated conservatively
 			status.NeedsRecovery = true
 			status.Verdict = "NEEDS_RECOVERY"
 		}
@@ -1305,173 +1121,28 @@ func splitLines(s string) []string {
 }
 
 func runPolecatNuke(cmd *cobra.Command, args []string) error {
-	// Build list of polecats to nuke
-	type polecatToNuke struct {
-		rigName     string
-		polecatName string
-		mgr         *polecat.Manager
-		r           *rig.Rig
+	targets, err := resolvePolecatTargets(args, polecatNukeAll)
+	if err != nil {
+		return err
 	}
-	var toNuke []polecatToNuke
 
-	if polecatNukeAll {
-		// --all flag: first arg is just the rig name
-		rigName := args[0]
-		// Check if it looks like rig/polecat format
-		if _, _, err := parseAddress(rigName); err == nil {
-			return fmt.Errorf("with --all, provide just the rig name (e.g., 'gt polecat nuke greenplace --all')")
-		}
-
-		mgr, r, err := getPolecatManager(rigName)
-		if err != nil {
-			return err
-		}
-
-		polecats, err := mgr.List()
-		if err != nil {
-			return fmt.Errorf("listing polecats: %w", err)
-		}
-
-		if len(polecats) == 0 {
-			fmt.Println("No polecats to nuke.")
-			return nil
-		}
-
-		for _, p := range polecats {
-			toNuke = append(toNuke, polecatToNuke{
-				rigName:     rigName,
-				polecatName: p.Name,
-				mgr:         mgr,
-				r:           r,
-			})
-		}
-	} else {
-		// Multiple rig/polecat arguments - require explicit rig/polecat format
-		for _, arg := range args {
-			// Validate format: must contain "/" to avoid misinterpreting rig names as polecat names
-			if !strings.Contains(arg, "/") {
-				return fmt.Errorf("invalid address '%s': must be in 'rig/polecat' format (e.g., 'gastown/Toast')", arg)
-			}
-
-			rigName, polecatName, err := parseAddress(arg)
-			if err != nil {
-				return fmt.Errorf("invalid address '%s': %w", arg, err)
-			}
-
-			mgr, r, err := getPolecatManager(rigName)
-			if err != nil {
-				return err
-			}
-
-			toNuke = append(toNuke, polecatToNuke{
-				rigName:     rigName,
-				polecatName: polecatName,
-				mgr:         mgr,
-				r:           r,
-			})
-		}
+	if len(targets) == 0 {
+		fmt.Println("No polecats to nuke.")
+		return nil
 	}
 
 	// Safety checks: refuse to nuke polecats with active work unless --force is set
-	// Checks:
-	// 1. Unpushed commits - worktree has uncommitted/unpushed changes
-	// 2. Open MR beads - polecat has open merge requests pending
-	// 3. Work on hook - polecat has work assigned to its hook
 	if !polecatNukeForce && !polecatNukeDryRun {
-		type blockReason struct {
-			polecat string
-			reasons []string
-		}
-		var blocked []blockReason
-
-		for _, p := range toNuke {
-			var reasons []string
-
-			// Get polecat info for branch name
-			polecatInfo, infoErr := p.mgr.Get(p.polecatName)
-
-			// Check 1: Unpushed commits via cleanup_status or git state
-			bd := beads.New(p.r.Path)
-			agentBeadID := beads.PolecatBeadID(p.rigName, p.polecatName)
-			agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
-
-			if err != nil || fields == nil {
-				// No agent bead - fall back to git check
-				if infoErr == nil && polecatInfo != nil {
-					gitState, gitErr := getGitState(polecatInfo.ClonePath)
-					if gitErr != nil {
-						reasons = append(reasons, "cannot check git state")
-					} else if !gitState.Clean {
-						if gitState.UnpushedCommits > 0 {
-							reasons = append(reasons, fmt.Sprintf("has %d unpushed commit(s)", gitState.UnpushedCommits))
-						} else if len(gitState.UncommittedFiles) > 0 {
-							reasons = append(reasons, fmt.Sprintf("has %d uncommitted file(s)", len(gitState.UncommittedFiles)))
-						} else if gitState.StashCount > 0 {
-							reasons = append(reasons, fmt.Sprintf("has %d stash(es)", gitState.StashCount))
-						}
-					}
-				}
-			} else {
-				// Check cleanup_status from agent bead
-				switch fields.CleanupStatus {
-				case "clean":
-					// OK
-				case "has_unpushed":
-					reasons = append(reasons, "has unpushed commits")
-				case "has_uncommitted":
-					reasons = append(reasons, "has uncommitted changes")
-				case "has_stash":
-					reasons = append(reasons, "has stashed changes")
-				case "unknown", "":
-					reasons = append(reasons, "cleanup status unknown")
-				default:
-					reasons = append(reasons, fmt.Sprintf("cleanup status: %s", fields.CleanupStatus))
-				}
-
-				// Check 3: Work on hook (check both Issue.HookBead from slot and fields.HookBead)
-				hookBead := agentIssue.HookBead
-				if hookBead == "" {
-					hookBead = fields.HookBead
-				}
-				if hookBead != "" {
-					reasons = append(reasons, fmt.Sprintf("has work on hook (%s)", hookBead))
-				}
-			}
-
-			// Check 2: Open MR beads for this branch
-			if infoErr == nil && polecatInfo != nil && polecatInfo.Branch != "" {
-				mr, mrErr := bd.FindMRForBranch(polecatInfo.Branch)
-				if mrErr == nil && mr != nil {
-					reasons = append(reasons, fmt.Sprintf("has open MR (%s)", mr.ID))
-				}
-			}
-
-			if len(reasons) > 0 {
-				blocked = append(blocked, blockReason{
-					polecat: fmt.Sprintf("%s/%s", p.rigName, p.polecatName),
-					reasons: reasons,
-				})
+		var blocked []*SafetyCheckResult
+		for _, p := range targets {
+			result := checkPolecatSafety(p)
+			if result.Blocked {
+				blocked = append(blocked, result)
 			}
 		}
 
 		if len(blocked) > 0 {
-			fmt.Printf("%s Cannot nuke the following polecats:\n\n", style.Error.Render("Error:"))
-			var polecatList []string
-			for _, b := range blocked {
-				fmt.Printf("  %s:\n", style.Bold.Render(b.polecat))
-				for _, r := range b.reasons {
-					fmt.Printf("    - %s\n", r)
-				}
-				polecatList = append(polecatList, b.polecat)
-			}
-			fmt.Println()
-			fmt.Println("Safety checks failed. Resolve issues before nuking, or use --force.")
-			fmt.Println("Options:")
-			fmt.Printf("  1. Complete work: gt done (from polecat session)\n")
-			fmt.Printf("  2. Push changes: git push (from polecat worktree)\n")
-			fmt.Printf("  3. Escalate: gt mail send mayor/ -s \"RECOVERY_NEEDED\" -m \"...\"\n")
-			fmt.Printf("  4. Force nuke (LOSES WORK): gt polecat nuke --force %s\n", strings.Join(polecatList, " "))
-			fmt.Println()
+			displaySafetyCheckBlocked(blocked)
 			return fmt.Errorf("blocked: %d polecat(s) have active work", len(blocked))
 		}
 	}
@@ -1481,7 +1152,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 	var nukeErrors []string
 	nuked := 0
 
-	for _, p := range toNuke {
+	for _, p := range targets {
 		if polecatNukeDryRun {
 			fmt.Printf("Would nuke %s/%s:\n", p.rigName, p.polecatName)
 			fmt.Printf("  - Kill session: gt-%s-%s\n", p.rigName, p.polecatName)
@@ -1489,60 +1160,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  - Delete branch (if exists)\n")
 			fmt.Printf("  - Close agent bead: %s\n", beads.PolecatBeadID(p.rigName, p.polecatName))
 
-			// Show safety check status in dry-run
-			fmt.Printf("\n  Safety checks:\n")
-			polecatInfo, infoErr := p.mgr.Get(p.polecatName)
-			bd := beads.New(p.r.Path)
-			agentBeadID := beads.PolecatBeadID(p.rigName, p.polecatName)
-			agentIssue, fields, err := bd.GetAgentBead(agentBeadID)
-
-			// Check 1: Git state
-			if err != nil || fields == nil {
-				if infoErr == nil && polecatInfo != nil {
-					gitState, gitErr := getGitState(polecatInfo.ClonePath)
-					if gitErr != nil {
-						fmt.Printf("    - Git state: %s\n", style.Warning.Render("cannot check"))
-					} else if gitState.Clean {
-						fmt.Printf("    - Git state: %s\n", style.Success.Render("clean"))
-					} else {
-						fmt.Printf("    - Git state: %s\n", style.Error.Render("dirty"))
-					}
-				} else {
-					fmt.Printf("    - Git state: %s\n", style.Dim.Render("unknown (no polecat info)"))
-				}
-				fmt.Printf("    - Hook: %s\n", style.Dim.Render("unknown (no agent bead)"))
-			} else {
-				if fields.CleanupStatus == "clean" {
-					fmt.Printf("    - Git state: %s\n", style.Success.Render("clean"))
-				} else if fields.CleanupStatus != "" {
-					fmt.Printf("    - Git state: %s (%s)\n", style.Error.Render("dirty"), fields.CleanupStatus)
-				} else {
-					fmt.Printf("    - Git state: %s\n", style.Warning.Render("unknown"))
-				}
-
-				hookBead := agentIssue.HookBead
-				if hookBead == "" {
-					hookBead = fields.HookBead
-				}
-				if hookBead != "" {
-					fmt.Printf("    - Hook: %s (%s)\n", style.Error.Render("has work"), hookBead)
-				} else {
-					fmt.Printf("    - Hook: %s\n", style.Success.Render("empty"))
-				}
-			}
-
-			// Check 2: Open MR
-			if infoErr == nil && polecatInfo != nil && polecatInfo.Branch != "" {
-				mr, mrErr := bd.FindMRForBranch(polecatInfo.Branch)
-				if mrErr == nil && mr != nil {
-					fmt.Printf("    - Open MR: %s (%s)\n", style.Error.Render("yes"), mr.ID)
-				} else {
-					fmt.Printf("    - Open MR: %s\n", style.Success.Render("none"))
-				}
-			} else {
-				fmt.Printf("    - Open MR: %s\n", style.Dim.Render("unknown (no branch info)"))
-			}
-
+			displayDryRunSafetyCheck(p)
 			fmt.Println()
 			continue
 		}
@@ -1554,10 +1172,10 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 		}
 
 		// Step 1: Kill session (force mode - no graceful shutdown)
-		sessMgr := session.NewManager(t, p.r)
-		running, _ := sessMgr.IsRunning(p.polecatName)
+		polecatMgr := polecat.NewSessionManager(t, p.r)
+		running, _ := polecatMgr.IsRunning(p.polecatName)
 		if running {
-			if err := sessMgr.Stop(p.polecatName, true); err != nil {
+			if err := polecatMgr.Stop(p.polecatName, true); err != nil {
 				fmt.Printf("  %s session kill failed: %v\n", style.Warning.Render("⚠"), err)
 				// Continue anyway - worktree removal will still work
 			} else {
@@ -1598,7 +1216,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 		// Step 5: Close agent bead (if exists)
 		agentBeadID := beads.PolecatBeadID(p.rigName, p.polecatName)
 		closeArgs := []string{"close", agentBeadID, "--reason=nuked"}
-		if sessionID := os.Getenv("CLAUDE_SESSION_ID"); sessionID != "" {
+		if sessionID := runtime.SessionIDFromEnv(); sessionID != "" {
 			closeArgs = append(closeArgs, "--session="+sessionID)
 		}
 		closeCmd := exec.Command("bd", closeArgs...)
@@ -1615,7 +1233,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 
 	// Report results
 	if polecatNukeDryRun {
-		fmt.Printf("\n%s Would nuke %d polecat(s).\n", style.Info.Render("ℹ"), len(toNuke))
+		fmt.Printf("\n%s Would nuke %d polecat(s).\n", style.Info.Render("ℹ"), len(targets))
 		return nil
 	}
 
@@ -1632,6 +1250,119 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 
 	if len(nukeErrors) > 0 {
 		return fmt.Errorf("%d nuke(s) failed", len(nukeErrors))
+	}
+
+	return nil
+}
+
+func runPolecatStale(cmd *cobra.Command, args []string) error {
+	rigName := args[0]
+	mgr, r, err := getPolecatManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Detecting stale polecats in %s (threshold: %d commits behind main)...\n\n", r.Name, polecatStaleThreshold)
+
+	staleInfos, err := mgr.DetectStalePolecats(polecatStaleThreshold)
+	if err != nil {
+		return fmt.Errorf("detecting stale polecats: %w", err)
+	}
+
+	if len(staleInfos) == 0 {
+		fmt.Println("No polecats found.")
+		return nil
+	}
+
+	// JSON output
+	if polecatStaleJSON {
+		return json.NewEncoder(os.Stdout).Encode(staleInfos)
+	}
+
+	// Summary counts
+	var staleCount, safeCount int
+	for _, info := range staleInfos {
+		if info.IsStale {
+			staleCount++
+		} else {
+			safeCount++
+		}
+	}
+
+	// Display results
+	for _, info := range staleInfos {
+		statusIcon := style.Success.Render("●")
+		statusText := "active"
+		if info.IsStale {
+			statusIcon = style.Warning.Render("○")
+			statusText = "stale"
+		}
+
+		fmt.Printf("%s %s (%s)\n", statusIcon, style.Bold.Render(info.Name), statusText)
+
+		// Session status
+		if info.HasActiveSession {
+			fmt.Printf("    Session: %s\n", style.Success.Render("running"))
+		} else {
+			fmt.Printf("    Session: %s\n", style.Dim.Render("stopped"))
+		}
+
+		// Commits behind
+		if info.CommitsBehind > 0 {
+			behindStyle := style.Dim
+			if info.CommitsBehind >= polecatStaleThreshold {
+				behindStyle = style.Warning
+			}
+			fmt.Printf("    Behind main: %s\n", behindStyle.Render(fmt.Sprintf("%d commits", info.CommitsBehind)))
+		}
+
+		// Agent state
+		if info.AgentState != "" {
+			fmt.Printf("    Agent state: %s\n", info.AgentState)
+		} else {
+			fmt.Printf("    Agent state: %s\n", style.Dim.Render("no bead"))
+		}
+
+		// Uncommitted work
+		if info.HasUncommittedWork {
+			fmt.Printf("    Uncommitted: %s\n", style.Error.Render("yes"))
+		}
+
+		// Reason
+		fmt.Printf("    Reason: %s\n", info.Reason)
+		fmt.Println()
+	}
+
+	// Summary
+	fmt.Printf("Summary: %d stale, %d active\n", staleCount, safeCount)
+
+	// Cleanup if requested
+	if polecatStaleCleanup && staleCount > 0 {
+		fmt.Println()
+		if polecatNukeDryRun {
+			fmt.Printf("Would clean up %d stale polecat(s):\n", staleCount)
+			for _, info := range staleInfos {
+				if info.IsStale {
+					fmt.Printf("  - %s: %s\n", info.Name, info.Reason)
+				}
+			}
+		} else {
+			fmt.Printf("Cleaning up %d stale polecat(s)...\n", staleCount)
+			nuked := 0
+			for _, info := range staleInfos {
+				if !info.IsStale {
+					continue
+				}
+				fmt.Printf("  Nuking %s...", info.Name)
+				if err := mgr.RemoveWithOptions(info.Name, true, false); err != nil {
+					fmt.Printf(" %s (%v)\n", style.Error.Render("failed"), err)
+				} else {
+					fmt.Printf(" %s\n", style.Success.Render("done"))
+					nuked++
+				}
+			}
+			fmt.Printf("\n%s Nuked %d stale polecat(s).\n", style.SuccessPrefix, nuked)
+		}
 	}
 
 	return nil

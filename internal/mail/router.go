@@ -1,16 +1,16 @@
 package mail
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -86,23 +86,48 @@ func parseAnnounceName(address string) string {
 	return strings.TrimPrefix(address, "announce:")
 }
 
-// expandList returns the recipients for a mailing list.
-// Returns ErrUnknownList if the list is not found.
-func (r *Router) expandList(listName string) ([]string, error) {
-	// Load messaging config from town root
+// isChannelAddress returns true if the address uses channel:name syntax (beads-native channels).
+func isChannelAddress(address string) bool {
+	return strings.HasPrefix(address, "channel:")
+}
+
+// parseChannelName extracts the channel name from a channel:name address.
+func parseChannelName(address string) string {
+	return strings.TrimPrefix(address, "channel:")
+}
+
+// expandFromConfig is a generic helper for config-based expansion.
+// It loads the messaging config and calls the getter to extract the desired value.
+// This consolidates the common pattern of: check townRoot, load config, lookup in map.
+func expandFromConfig[T any](r *Router, name string, getter func(*config.MessagingConfig) (T, bool), errType error) (T, error) {
+	var zero T
 	if r.townRoot == "" {
-		return nil, fmt.Errorf("%w: %s (no town root)", ErrUnknownList, listName)
+		return zero, fmt.Errorf("%w: %s (no town root)", errType, name)
 	}
 
 	configPath := config.MessagingConfigPath(r.townRoot)
 	cfg, err := config.LoadMessagingConfig(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("loading messaging config: %w", err)
+		return zero, fmt.Errorf("loading messaging config: %w", err)
 	}
 
-	recipients, ok := cfg.Lists[listName]
+	result, ok := getter(cfg)
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownList, listName)
+		return zero, fmt.Errorf("%w: %s", errType, name)
+	}
+
+	return result, nil
+}
+
+// expandList returns the recipients for a mailing list.
+// Returns ErrUnknownList if the list is not found.
+func (r *Router) expandList(listName string) ([]string, error) {
+	recipients, err := expandFromConfig(r, listName, func(cfg *config.MessagingConfig) ([]string, bool) {
+		r, ok := cfg.Lists[listName]
+		return r, ok
+	}, ErrUnknownList)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(recipients) == 0 {
@@ -115,45 +140,25 @@ func (r *Router) expandList(listName string) ([]string, error) {
 // expandQueue returns the QueueConfig for a queue name.
 // Returns ErrUnknownQueue if the queue is not found.
 func (r *Router) expandQueue(queueName string) (*config.QueueConfig, error) {
-	// Load messaging config from town root
-	if r.townRoot == "" {
-		return nil, fmt.Errorf("%w: %s (no town root)", ErrUnknownQueue, queueName)
-	}
-
-	configPath := config.MessagingConfigPath(r.townRoot)
-	cfg, err := config.LoadMessagingConfig(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("loading messaging config: %w", err)
-	}
-
-	queueCfg, ok := cfg.Queues[queueName]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownQueue, queueName)
-	}
-
-	return &queueCfg, nil
+	return expandFromConfig(r, queueName, func(cfg *config.MessagingConfig) (*config.QueueConfig, bool) {
+		qc, ok := cfg.Queues[queueName]
+		if !ok {
+			return nil, false
+		}
+		return &qc, true
+	}, ErrUnknownQueue)
 }
 
 // expandAnnounce returns the AnnounceConfig for an announce channel name.
 // Returns ErrUnknownAnnounce if the channel is not found.
 func (r *Router) expandAnnounce(announceName string) (*config.AnnounceConfig, error) {
-	// Load messaging config from town root
-	if r.townRoot == "" {
-		return nil, fmt.Errorf("%w: %s (no town root)", ErrUnknownAnnounce, announceName)
-	}
-
-	configPath := config.MessagingConfigPath(r.townRoot)
-	cfg, err := config.LoadMessagingConfig(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("loading messaging config: %w", err)
-	}
-
-	announceCfg, ok := cfg.Announces[announceName]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownAnnounce, announceName)
-	}
-
-	return &announceCfg, nil
+	return expandFromConfig(r, announceName, func(cfg *config.MessagingConfig) (*config.AnnounceConfig, bool) {
+		ac, ok := cfg.Announces[announceName]
+		if !ok {
+			return nil, false
+		}
+		return &ac, true
+	}, ErrUnknownAnnounce)
 }
 
 // detectTownRoot finds the town root by looking for mayor/town.json.
@@ -183,7 +188,7 @@ func detectTownRoot(startDir string) string {
 // - Rig-level beads ({rig}/.beads) are for project issues only, not mail
 //
 // This ensures messages are visible to all agents in the town.
-func (r *Router) resolveBeadsDir(address string) string {
+func (r *Router) resolveBeadsDir(_ string) string { // address unused: all mail uses town-level beads
 	// If no town root, fall back to workDir's .beads
 	if r.townRoot == "" {
 		return filepath.Join(r.workDir, ".beads")
@@ -452,24 +457,13 @@ func (r *Router) queryAgents(descContains string) ([]*agentBead, error) {
 		args = append(args, "--desc-contains="+descContains)
 	}
 
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(cmd.Environ(), "BEADS_DIR="+beadsDir)
-	cmd.Dir = filepath.Dir(beadsDir)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return nil, errors.New(errMsg)
-		}
+	stdout, err := runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	if err != nil {
 		return nil, fmt.Errorf("querying agents: %w", err)
 	}
 
 	var agents []*agentBead
-	if err := json.Unmarshal(stdout.Bytes(), &agents); err != nil {
+	if err := json.Unmarshal(stdout, &agents); err != nil {
 		return nil, fmt.Errorf("parsing agent query result: %w", err)
 	}
 
@@ -530,6 +524,11 @@ func (r *Router) Send(msg *Message) error {
 	// Check for announce address - bulletin board (single copy, no claiming)
 	if isAnnounceAddress(msg.To) {
 		return r.sendToAnnounce(msg)
+	}
+
+	// Check for beads-native channel address - broadcast with retention
+	if isChannelAddress(msg.To) {
+		return r.sendToChannel(msg)
 	}
 
 	// Check for @group address - resolve and fan-out
@@ -621,20 +620,8 @@ func (r *Router) sendToSingle(msg *Message) error {
 	}
 
 	beadsDir := r.resolveBeadsDir(msg.To)
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(cmd.Environ(),
-		"BEADS_DIR="+beadsDir,
-	)
-	cmd.Dir = filepath.Dir(beadsDir) // Run in parent of .beads
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return errors.New(errMsg)
-		}
+	_, err := runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	if err != nil {
 		return fmt.Errorf("sending message: %w", err)
 	}
 
@@ -743,20 +730,8 @@ func (r *Router) sendToQueue(msg *Message) error {
 
 	// Queue messages go to town-level beads (shared location)
 	beadsDir := r.resolveBeadsDir("")
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(cmd.Environ(),
-		"BEADS_DIR="+beadsDir,
-	)
-	cmd.Dir = filepath.Dir(beadsDir) // Run in parent of .beads
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return errors.New(errMsg)
-		}
+	_, err = runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	if err != nil {
 		return fmt.Errorf("sending to queue %s: %w", queueName, err)
 	}
 
@@ -826,24 +801,87 @@ func (r *Router) sendToAnnounce(msg *Message) error {
 
 	// Announce messages go to town-level beads (shared location)
 	beadsDir := r.resolveBeadsDir("")
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(cmd.Environ(),
-		"BEADS_DIR="+beadsDir,
-	)
-	cmd.Dir = filepath.Dir(beadsDir) // Run in parent of .beads
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return errors.New(errMsg)
-		}
+	_, err = runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	if err != nil {
 		return fmt.Errorf("sending to announce %s: %w", announceName, err)
 	}
 
 	// No notification for announce messages - readers poll or check on their own schedule
+
+	return nil
+}
+
+// sendToChannel delivers a message to a beads-native channel.
+// Creates a message with channel:<name> label for channel queries.
+// Retention is enforced by the channel's EnforceChannelRetention after message creation.
+func (r *Router) sendToChannel(msg *Message) error {
+	channelName := parseChannelName(msg.To)
+
+	// Validate channel exists as a beads-native channel
+	if r.townRoot == "" {
+		return fmt.Errorf("town root not set, cannot send to channel: %s", channelName)
+	}
+	b := beads.New(r.townRoot)
+	_, fields, err := b.GetChannelBead(channelName)
+	if err != nil {
+		return fmt.Errorf("getting channel %s: %w", channelName, err)
+	}
+	if fields == nil {
+		return fmt.Errorf("channel not found: %s", channelName)
+	}
+	if fields.Status == beads.ChannelStatusClosed {
+		return fmt.Errorf("channel %s is closed", channelName)
+	}
+
+	// Build labels for from/thread/reply-to/cc plus channel metadata
+	var labels []string
+	labels = append(labels, "from:"+msg.From)
+	labels = append(labels, "channel:"+channelName)
+	if msg.ThreadID != "" {
+		labels = append(labels, "thread:"+msg.ThreadID)
+	}
+	if msg.ReplyTo != "" {
+		labels = append(labels, "reply-to:"+msg.ReplyTo)
+	}
+	for _, cc := range msg.CC {
+		ccIdentity := addressToIdentity(cc)
+		labels = append(labels, "cc:"+ccIdentity)
+	}
+
+	// Build command: bd create <subject> --type=message --assignee=channel:<name> -d <body>
+	// Use channel:<name> as assignee so queries can filter by channel
+	args := []string{"create", msg.Subject,
+		"--type", "message",
+		"--assignee", msg.To, // channel:name
+		"-d", msg.Body,
+	}
+
+	// Add priority flag
+	beadsPriority := PriorityToBeads(msg.Priority)
+	args = append(args, "--priority", fmt.Sprintf("%d", beadsPriority))
+
+	// Add labels (includes channel name for filtering)
+	if len(labels) > 0 {
+		args = append(args, "--labels", strings.Join(labels, ","))
+	}
+
+	// Add actor for attribution (sender identity)
+	args = append(args, "--actor", msg.From)
+
+	// Channel messages are never ephemeral - they persist according to retention policy
+	// (deliberately not checking shouldBeWisp)
+
+	// Channel messages go to town-level beads (shared location)
+	beadsDir := r.resolveBeadsDir("")
+	_, err = runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	if err != nil {
+		return fmt.Errorf("sending to channel %s: %w", channelName, err)
+	}
+
+	// Enforce channel retention policy (on-write cleanup)
+	_ = b.EnforceChannelRetention(channelName)
+
+	// No notification for channel messages - readers poll or check on their own schedule
 
 	return nil
 }
@@ -868,19 +906,8 @@ func (r *Router) pruneAnnounce(announceName string, retainCount int) error {
 		"--asc", // Oldest first
 	}
 
-	cmd := exec.Command("bd", args...)
-	cmd.Env = append(cmd.Environ(), "BEADS_DIR="+beadsDir)
-	cmd.Dir = filepath.Dir(beadsDir)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		errMsg := strings.TrimSpace(stderr.String())
-		if errMsg != "" {
-			return errors.New(errMsg)
-		}
+	stdout, err := runBdCommand(args, filepath.Dir(beadsDir), beadsDir)
+	if err != nil {
 		return fmt.Errorf("querying announce messages: %w", err)
 	}
 
@@ -888,7 +915,7 @@ func (r *Router) pruneAnnounce(announceName string, retainCount int) error {
 	var messages []struct {
 		ID string `json:"id"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &messages); err != nil {
+	if err := json.Unmarshal(stdout, &messages); err != nil {
 		return fmt.Errorf("parsing announce messages: %w", err)
 	}
 
@@ -903,12 +930,8 @@ func (r *Router) pruneAnnounce(announceName string, retainCount int) error {
 	// Delete oldest messages
 	for i := 0; i < toDelete && i < len(messages); i++ {
 		deleteArgs := []string{"close", messages[i].ID, "--reason=retention pruning"}
-		deleteCmd := exec.Command("bd", deleteArgs...)
-		deleteCmd.Env = append(deleteCmd.Environ(), "BEADS_DIR="+beadsDir)
-		deleteCmd.Dir = filepath.Dir(beadsDir)
-
 		// Best-effort deletion - don't fail if one delete fails
-		_ = deleteCmd.Run()
+		_, _ = runBdCommand(deleteArgs, filepath.Dir(beadsDir), beadsDir)
 	}
 
 	return nil
@@ -931,7 +954,7 @@ func (r *Router) GetMailbox(address string) (*Mailbox, error) {
 }
 
 // notifyRecipient sends a notification to a recipient's tmux session.
-// Uses send-keys to echo a visible banner to ensure notification is seen.
+// Uses NudgeSession to add the notification to the agent's conversation history.
 // Supports mayor/, rig/polecat, and rig/refinery addresses.
 func (r *Router) notifyRecipient(msg *Message) error {
 	sessionID := addressToSessionID(msg.To)
@@ -945,8 +968,9 @@ func (r *Router) notifyRecipient(msg *Message) error {
 		return nil // No active session, skip notification
 	}
 
-	// Send visible notification banner to the terminal
-	return r.tmux.SendNotificationBanner(sessionID, msg.From, msg.Subject)
+	// Send notification to the agent's conversation history
+	notification := fmt.Sprintf("📬 You have new mail from %s. Subject: %s. Run 'gt mail inbox' to read.", msg.From, msg.Subject)
+	return r.tmux.NudgeSession(sessionID, notification)
 }
 
 // addressToSessionID converts a mail address to a tmux session ID.
@@ -954,7 +978,12 @@ func (r *Router) notifyRecipient(msg *Message) error {
 func addressToSessionID(address string) string {
 	// Mayor address: "mayor/" or "mayor"
 	if strings.HasPrefix(address, "mayor") {
-		return "gt-mayor"
+		return session.MayorSessionName()
+	}
+
+	// Deacon address: "deacon/" or "deacon"
+	if strings.HasPrefix(address, "deacon") {
+		return session.DeaconSessionName()
 	}
 
 	// Rig-based address: "rig/target"

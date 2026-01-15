@@ -5,15 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/gastown/internal/claude"
-	"github.com/steveyegge/gastown/internal/config"
-	"github.com/steveyegge/gastown/internal/constants"
-	"github.com/steveyegge/gastown/internal/rig"
-	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/witness"
@@ -22,8 +15,10 @@ import (
 
 // Witness command flags
 var (
-	witnessForeground bool
-	witnessStatusJSON bool
+	witnessForeground    bool
+	witnessStatusJSON    bool
+	witnessAgentOverride string
+	witnessEnvOverrides  []string
 )
 
 var witnessCmd = &cobra.Command{
@@ -33,8 +28,12 @@ var witnessCmd = &cobra.Command{
 	RunE:    requireSubcommand,
 	Long: `Manage the Witness monitoring agent for a rig.
 
-The Witness monitors polecats for stuck/idle state, nudges polecats
-that seem blocked, and reports status to the mayor.`,
+The Witness monitors polecats for stuck states and orphaned sandboxes,
+nudges polecats that seem blocked, and reports status to the mayor.
+
+In the self-cleaning model, polecats nuke themselves after work completion.
+The Witness handles edge cases: crashed sessions, orphaned worktrees, and
+stuck polecats that need intervention.`,
 }
 
 var witnessStartCmd = &cobra.Command{
@@ -43,11 +42,17 @@ var witnessStartCmd = &cobra.Command{
 	Short:   "Start the witness",
 	Long: `Start the Witness for a rig.
 
-Launches the monitoring agent which watches polecats for stuck or idle
-states and takes action to keep work flowing.
+Launches the monitoring agent which watches for stuck polecats and orphaned
+sandboxes, taking action to keep work flowing.
+
+Self-Cleaning Model: Polecats nuke themselves after work. The Witness handles
+crash recovery (restart with hooked work) and orphan cleanup (nuke abandoned
+sandboxes). There is no "idle" state - polecats either have work or don't exist.
 
 Examples:
   gt witness start greenplace
+  gt witness start greenplace --agent codex
+  gt witness start greenplace --env ANTHROPIC_MODEL=claude-3-haiku
   gt witness start greenplace --foreground`,
 	Args: cobra.ExactArgs(1),
 	RunE: runWitnessStart,
@@ -100,7 +105,9 @@ var witnessRestartCmd = &cobra.Command{
 Stops the current session (if running) and starts a fresh one.
 
 Examples:
-  gt witness restart greenplace`,
+  gt witness restart greenplace
+  gt witness restart greenplace --agent codex
+  gt witness restart greenplace --env ANTHROPIC_MODEL=claude-3-haiku`,
 	Args: cobra.ExactArgs(1),
 	RunE: runWitnessRestart,
 }
@@ -108,9 +115,15 @@ Examples:
 func init() {
 	// Start flags
 	witnessStartCmd.Flags().BoolVar(&witnessForeground, "foreground", false, "Run in foreground (default: background)")
+	witnessStartCmd.Flags().StringVar(&witnessAgentOverride, "agent", "", "Agent alias to run the Witness with (overrides town default)")
+	witnessStartCmd.Flags().StringArrayVar(&witnessEnvOverrides, "env", nil, "Environment variable override (KEY=VALUE, can be repeated)")
 
 	// Status flags
 	witnessStatusCmd.Flags().BoolVar(&witnessStatusJSON, "json", false, "Output as JSON")
+
+	// Restart flags
+	witnessRestartCmd.Flags().StringVar(&witnessAgentOverride, "agent", "", "Agent alias to run the Witness with (overrides town default)")
+	witnessRestartCmd.Flags().StringArrayVar(&witnessEnvOverrides, "env", nil, "Environment variable override (KEY=VALUE, can be repeated)")
 
 	// Add subcommands
 	witnessCmd.AddCommand(witnessStartCmd)
@@ -123,54 +136,40 @@ func init() {
 }
 
 // getWitnessManager creates a witness manager for a rig.
-func getWitnessManager(rigName string) (*witness.Manager, *rig.Rig, error) {
+func getWitnessManager(rigName string) (*witness.Manager, error) {
 	_, r, err := getRig(rigName)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	mgr := witness.NewManager(r)
-	return mgr, r, nil
+	return mgr, nil
 }
 
 func runWitnessStart(cmd *cobra.Command, args []string) error {
 	rigName := args[0]
 
-	mgr, r, err := getWitnessManager(rigName)
+	mgr, err := getWitnessManager(rigName)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("Starting witness for %s...\n", rigName)
 
-	if witnessForeground {
-		// Foreground mode is no longer supported - patrol logic moved to mol-witness-patrol
-		if err := mgr.Start(); err != nil {
-			if err == witness.ErrAlreadyRunning {
-				fmt.Printf("%s Witness is already running\n", style.Dim.Render("⚠"))
-				return nil
-			}
-			return fmt.Errorf("starting witness: %w", err)
+	if err := mgr.Start(witnessForeground, witnessAgentOverride, witnessEnvOverrides); err != nil {
+		if err == witness.ErrAlreadyRunning {
+			fmt.Printf("%s Witness is already running\n", style.Dim.Render("⚠"))
+			fmt.Printf("  %s\n", style.Dim.Render("Use 'gt witness attach' to connect"))
+			return nil
 		}
+		return fmt.Errorf("starting witness: %w", err)
+	}
+
+	if witnessForeground {
 		fmt.Printf("%s Note: Foreground mode no longer runs patrol loop\n", style.Dim.Render("⚠"))
 		fmt.Printf("  %s\n", style.Dim.Render("Patrol logic is now handled by mol-witness-patrol molecule"))
 		return nil
 	}
-
-	// Background mode: create tmux session with Claude
-	created, err := ensureWitnessSession(rigName, r)
-	if err != nil {
-		return err
-	}
-
-	if !created {
-		fmt.Printf("%s Witness session already running\n", style.Dim.Render("⚠"))
-		fmt.Printf("  %s\n", style.Dim.Render("Use 'gt witness attach' to connect"))
-		return nil
-	}
-
-	// Update manager state to reflect running session (non-fatal: state file update)
-	_ = mgr.Start()
 
 	fmt.Printf("%s Witness started for %s\n", style.Bold.Render("✓"), rigName)
 	fmt.Printf("  %s\n", style.Dim.Render("Use 'gt witness attach' to connect"))
@@ -181,7 +180,7 @@ func runWitnessStart(cmd *cobra.Command, args []string) error {
 func runWitnessStop(cmd *cobra.Command, args []string) error {
 	rigName := args[0]
 
-	mgr, _, err := getWitnessManager(rigName)
+	mgr, err := getWitnessManager(rigName)
 	if err != nil {
 		return err
 	}
@@ -215,7 +214,7 @@ func runWitnessStop(cmd *cobra.Command, args []string) error {
 func runWitnessStatus(cmd *cobra.Command, args []string) error {
 	rigName := args[0]
 
-	mgr, _, err := getWitnessManager(rigName)
+	mgr, err := getWitnessManager(rigName)
 	if err != nil {
 		return err
 	}
@@ -283,95 +282,6 @@ func witnessSessionName(rigName string) string {
 	return fmt.Sprintf("gt-%s-witness", rigName)
 }
 
-// ensureWitnessSession creates a witness tmux session if it doesn't exist.
-// Returns true if a new session was created, false if it already existed (and is healthy).
-// Implements 'ensure' semantics: if session exists but Claude is dead (zombie), kills and recreates.
-func ensureWitnessSession(rigName string, r *rig.Rig) (bool, error) {
-	t := tmux.NewTmux()
-	sessionName := witnessSessionName(rigName)
-
-	// Check if session already exists
-	running, err := t.HasSession(sessionName)
-	if err != nil {
-		return false, fmt.Errorf("checking session: %w", err)
-	}
-
-	if running {
-		// Session exists - check if Claude is actually running (healthy vs zombie)
-		if t.IsClaudeRunning(sessionName) {
-			// Healthy - Claude is running
-			return false, nil
-		}
-		// Zombie - tmux alive but Claude dead. Kill and recreate.
-		fmt.Printf("%s Detected zombie session (tmux alive, Claude dead). Recreating...\n", style.Dim.Render("⚠"))
-		if err := t.KillSession(sessionName); err != nil {
-			return false, fmt.Errorf("killing zombie session: %w", err)
-		}
-	}
-
-	// Working directory is the witness's rig clone (if it exists) or witness dir
-	// This ensures gt prime detects the Witness role correctly
-	witnessDir := filepath.Join(r.Path, "witness", "rig")
-	if _, err := os.Stat(witnessDir); os.IsNotExist(err) {
-		// Try witness/ without rig subdirectory
-		witnessDir = filepath.Join(r.Path, "witness")
-		if _, err := os.Stat(witnessDir); os.IsNotExist(err) {
-			// Fall back to rig path (shouldn't happen in normal setup)
-			witnessDir = r.Path
-		}
-	}
-
-	// Ensure Claude settings exist (autonomous role needs mail in SessionStart)
-	if err := claude.EnsureSettingsForRole(witnessDir, "witness"); err != nil {
-		return false, fmt.Errorf("ensuring Claude settings: %w", err)
-	}
-
-	// Create new tmux session
-	if err := t.NewSession(sessionName, witnessDir); err != nil {
-		return false, fmt.Errorf("creating session: %w", err)
-	}
-
-	// Set environment
-	bdActor := fmt.Sprintf("%s/witness", rigName)
-	t.SetEnvironment(sessionName, "GT_ROLE", "witness")
-	t.SetEnvironment(sessionName, "GT_RIG", rigName)
-	t.SetEnvironment(sessionName, "BD_ACTOR", bdActor)
-
-	// Apply Gas Town theming (non-fatal: theming failure doesn't affect operation)
-	theme := tmux.AssignTheme(rigName)
-	_ = t.ConfigureGasTownSession(sessionName, theme, rigName, "witness", "witness")
-
-	// Launch Claude directly (no shell respawn loop)
-	// Restarts are handled by daemon via LIFECYCLE mail or deacon health-scan
-	// NOTE: No gt prime injection needed - SessionStart hook handles it automatically
-	// Export GT_ROLE and BD_ACTOR in the command since tmux SetEnvironment only affects new panes
-	if err := t.SendKeys(sessionName, config.BuildAgentStartupCommand("witness", bdActor, "", "")); err != nil {
-		return false, fmt.Errorf("sending command: %w", err)
-	}
-
-	// Wait for Claude to start (non-fatal)
-	if err := t.WaitForCommand(sessionName, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
-		// Non-fatal
-	}
-	time.Sleep(constants.ShutdownNotifyDelay)
-
-	// Inject startup nudge for predecessor discovery via /resume
-	address := fmt.Sprintf("%s/witness", rigName)
-	_ = session.StartupNudge(t, sessionName, session.StartupNudgeConfig{
-		Recipient: address,
-		Sender:    "deacon",
-		Topic:     "patrol",
-	}) // Non-fatal
-
-	// GUPP: Gas Town Universal Propulsion Principle
-	// Send the propulsion nudge to trigger autonomous patrol execution.
-	// Wait for beacon to be fully processed (needs to be separate prompt)
-	time.Sleep(2 * time.Second)
-	_ = t.NudgeSession(sessionName, session.PropulsionNudgeForRole("witness")) // Non-fatal
-
-	return true, nil
-}
-
 func runWitnessAttach(cmd *cobra.Command, args []string) error {
 	rigName := ""
 	if len(args) > 0 {
@@ -390,8 +300,8 @@ func runWitnessAttach(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Verify rig exists
-	_, r, err := getWitnessManager(rigName)
+	// Verify rig exists and get manager
+	mgr, err := getWitnessManager(rigName)
 	if err != nil {
 		return err
 	}
@@ -399,12 +309,9 @@ func runWitnessAttach(cmd *cobra.Command, args []string) error {
 	sessionName := witnessSessionName(rigName)
 
 	// Ensure session exists (creates if needed)
-	created, err := ensureWitnessSession(rigName, r)
-	if err != nil {
+	if err := mgr.Start(false, "", nil); err != nil && err != witness.ErrAlreadyRunning {
 		return err
-	}
-
-	if created {
+	} else if err == nil {
 		fmt.Printf("Started witness session for %s\n", rigName)
 	}
 
@@ -424,34 +331,19 @@ func runWitnessAttach(cmd *cobra.Command, args []string) error {
 func runWitnessRestart(cmd *cobra.Command, args []string) error {
 	rigName := args[0]
 
-	mgr, r, err := getWitnessManager(rigName)
+	mgr, err := getWitnessManager(rigName)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("Restarting witness for %s...\n", rigName)
 
-	// Kill tmux session if it exists
-	t := tmux.NewTmux()
-	sessionName := witnessSessionName(rigName)
-	running, _ := t.HasSession(sessionName)
-	if running {
-		if err := t.KillSession(sessionName); err != nil {
-			style.PrintWarning("failed to kill session: %v", err)
-		}
-	}
-
-	// Update state file to stopped (non-fatal: state file update)
+	// Stop existing session (non-fatal: may not be running)
 	_ = mgr.Stop()
 
 	// Start fresh
-	created, err := ensureWitnessSession(rigName, r)
-	if err != nil {
+	if err := mgr.Start(false, witnessAgentOverride, witnessEnvOverrides); err != nil {
 		return fmt.Errorf("starting witness: %w", err)
-	}
-
-	if created {
-		_ = mgr.Start() // non-fatal: state file update
 	}
 
 	fmt.Printf("%s Witness restarted for %s\n", style.Bold.Render("✓"), rigName)

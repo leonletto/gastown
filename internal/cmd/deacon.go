@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,18 +12,23 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/claude"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
 	"github.com/steveyegge/gastown/internal/polecat"
+	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
-// DeaconSessionName is the tmux session name for the Deacon.
-const DeaconSessionName = "gt-deacon"
+// getDeaconSessionName returns the Deacon session name.
+func getDeaconSessionName() string {
+	return session.DeaconSessionName()
+}
 
 var deaconCmd = &cobra.Command{
 	Use:     "deacon",
@@ -85,6 +91,8 @@ Stops the current session (if running) and starts a fresh one.`,
 	RunE: runDeaconRestart,
 }
 
+var deaconAgentOverride string
+
 var deaconHeartbeatCmd = &cobra.Command{
 	Use:   "heartbeat [action]",
 	Short: "Update the Deacon heartbeat",
@@ -106,7 +114,7 @@ var deaconTriggerPendingCmd = &cobra.Command{
 
 ⚠️  BOOTSTRAP MODE ONLY - Uses regex detection (ZFC violation acceptable).
 
-This command uses WaitForClaudeReady (regex) to detect when Claude is ready.
+This command uses WaitForRuntimeReady (regex) to detect when the runtime is ready.
 This is appropriate for daemon bootstrap when no AI is available.
 
 In steady-state, the Deacon should use AI-based observation instead:
@@ -183,32 +191,49 @@ This helps the Deacon understand which agents may need attention.`,
 	RunE: runDeaconHealthState,
 }
 
-var deaconZombieScanCmd = &cobra.Command{
-	Use:   "zombie-scan [rig]",
-	Short: "Scan for idle polecats that should have been nuked",
-	Long: `Backup check for polecats the Witness should have cleaned up.
+var deaconStaleHooksCmd = &cobra.Command{
+	Use:   "stale-hooks",
+	Short: "Find and unhook stale hooked beads",
+	Long: `Find beads stuck in 'hooked' status and unhook them if the agent is gone.
 
-Scans for "zombie" polecats that meet ALL of these criteria:
-- State: idle or done (no active work)
-- Session: not running (tmux session dead)
-- No hooked work
-- Last activity: older than threshold (default 10 minutes)
-
-These are polecats that the Witness should have nuked but didn't.
-This provides defense-in-depth against Witness failures.
-
-Actions:
-1. Log warning about witness failure
-2. Nuke the zombie polecat directly
-3. Notify mayor of witness issue (optional)
+Beads can get stuck in 'hooked' status when agents die or abandon work.
+This command finds hooked beads older than the threshold (default: 1 hour),
+checks if the assignee agent is still alive, and unhooks them if not.
 
 Examples:
-  gt deacon zombie-scan                    # Scan all rigs
-  gt deacon zombie-scan gastown            # Scan specific rig
-  gt deacon zombie-scan --dry-run          # Preview only
-  gt deacon zombie-scan --threshold=5m     # Custom staleness threshold`,
-	Args: cobra.MaximumNArgs(1),
-	RunE: runDeaconZombieScan,
+  gt deacon stale-hooks                 # Find and unhook stale beads
+  gt deacon stale-hooks --dry-run       # Preview what would be unhooked
+  gt deacon stale-hooks --max-age=30m   # Use 30 minute threshold`,
+	RunE: runDeaconStaleHooks,
+}
+
+var deaconPauseCmd = &cobra.Command{
+	Use:   "pause",
+	Short: "Pause the Deacon to prevent patrol actions",
+	Long: `Pause the Deacon to prevent it from performing any patrol actions.
+
+When paused, the Deacon:
+- Will not create patrol molecules
+- Will not run health checks
+- Will not take any autonomous actions
+- Will display a PAUSED message on startup
+
+The pause state persists across session restarts. Use 'gt deacon resume'
+to allow the Deacon to work again.
+
+Examples:
+  gt deacon pause                           # Pause with no reason
+  gt deacon pause --reason="testing"        # Pause with a reason`,
+	RunE: runDeaconPause,
+}
+
+var deaconResumeCmd = &cobra.Command{
+	Use:   "resume",
+	Short: "Resume the Deacon to allow patrol actions",
+	Long: `Resume the Deacon so it can perform patrol actions again.
+
+This removes the pause file and allows the Deacon to work normally.`,
+	RunE: runDeaconResume,
 }
 
 var (
@@ -223,10 +248,12 @@ var (
 	forceKillReason     string
 	forceKillSkipNotify bool
 
-	// Zombie scan flags
-	zombieScanDryRun    bool
-	zombieScanThreshold time.Duration
-	zombieScanNuke      bool
+	// Stale hooks flags
+	staleHooksMaxAge time.Duration
+	staleHooksDryRun bool
+
+	// Pause flags
+	pauseReason string
 )
 
 func init() {
@@ -240,7 +267,9 @@ func init() {
 	deaconCmd.AddCommand(deaconHealthCheckCmd)
 	deaconCmd.AddCommand(deaconForceKillCmd)
 	deaconCmd.AddCommand(deaconHealthStateCmd)
-	deaconCmd.AddCommand(deaconZombieScanCmd)
+	deaconCmd.AddCommand(deaconStaleHooksCmd)
+	deaconCmd.AddCommand(deaconPauseCmd)
+	deaconCmd.AddCommand(deaconResumeCmd)
 
 	// Flags for trigger-pending
 	deaconTriggerPendingCmd.Flags().DurationVar(&triggerTimeout, "timeout", 2*time.Second,
@@ -260,13 +289,19 @@ func init() {
 	deaconForceKillCmd.Flags().BoolVar(&forceKillSkipNotify, "skip-notify", false,
 		"Skip sending notification mail to mayor")
 
-	// Flags for zombie-scan
-	deaconZombieScanCmd.Flags().BoolVarP(&zombieScanDryRun, "dry-run", "n", false,
-		"Show what would be done without nuking")
-	deaconZombieScanCmd.Flags().DurationVar(&zombieScanThreshold, "threshold", 10*time.Minute,
-		"Staleness threshold for zombie detection")
-	deaconZombieScanCmd.Flags().BoolVar(&zombieScanNuke, "nuke", true,
-		"Nuke detected zombies (use --nuke=false to report only)")
+	// Flags for stale-hooks
+	deaconStaleHooksCmd.Flags().DurationVar(&staleHooksMaxAge, "max-age", 1*time.Hour,
+		"Maximum age before a hooked bead is considered stale")
+	deaconStaleHooksCmd.Flags().BoolVar(&staleHooksDryRun, "dry-run", false,
+		"Preview what would be unhooked without making changes")
+
+	// Flags for pause
+	deaconPauseCmd.Flags().StringVar(&pauseReason, "reason", "",
+		"Reason for pausing the Deacon")
+
+	deaconStartCmd.Flags().StringVar(&deaconAgentOverride, "agent", "", "Agent alias to run the Deacon with (overrides town default)")
+	deaconAttachCmd.Flags().StringVar(&deaconAgentOverride, "agent", "", "Agent alias to run the Deacon with (overrides town default)")
+	deaconRestartCmd.Flags().StringVar(&deaconAgentOverride, "agent", "", "Agent alias to run the Deacon with (overrides town default)")
 
 	rootCmd.AddCommand(deaconCmd)
 }
@@ -274,8 +309,10 @@ func init() {
 func runDeaconStart(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
+	sessionName := getDeaconSessionName()
+
 	// Check if session already exists
-	running, err := t.HasSession(DeaconSessionName)
+	running, err := t.HasSession(sessionName)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
@@ -283,7 +320,7 @@ func runDeaconStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Deacon session already running. Attach with: gt deacon attach")
 	}
 
-	if err := startDeaconSession(t); err != nil {
+	if err := startDeaconSession(t, sessionName, deaconAgentOverride); err != nil {
 		return err
 	}
 
@@ -295,7 +332,7 @@ func runDeaconStart(cmd *cobra.Command, args []string) error {
 }
 
 // startDeaconSession creates and initializes the Deacon tmux session.
-func startDeaconSession(t *tmux.Tmux) error {
+func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 	// Find workspace root
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
@@ -310,52 +347,65 @@ func startDeaconSession(t *tmux.Tmux) error {
 		return fmt.Errorf("creating deacon directory: %w", err)
 	}
 
-	// Ensure deacon has patrol hooks (idempotent)
-	if err := ensurePatrolHooks(deaconDir); err != nil {
-		style.PrintWarning("Could not create deacon hooks: %v", err)
+	// Ensure Claude settings exist (autonomous role needs mail in SessionStart)
+	if err := claude.EnsureSettingsForRole(deaconDir, "deacon"); err != nil {
+		return fmt.Errorf("creating deacon settings: %w", err)
 	}
 
-	// Create session in deacon directory
+	// Build startup command first
+	// Export GT_ROLE and BD_ACTOR in the command since tmux SetEnvironment only affects new panes
+	startupCmd, err := config.BuildAgentStartupCommandWithAgentOverride("deacon", "", townRoot, "", "", agentOverride)
+	if err != nil {
+		return fmt.Errorf("building startup command: %w", err)
+	}
+
+	// Create session with command directly to avoid send-keys race condition.
+	// See: https://github.com/anthropics/gastown/issues/280
 	fmt.Println("Starting Deacon session...")
-	if err := t.NewSession(DeaconSessionName, deaconDir); err != nil {
+	if err := t.NewSessionWithCommand(sessionName, deaconDir, startupCmd); err != nil {
 		return fmt.Errorf("creating session: %w", err)
 	}
 
 	// Set environment (non-fatal: session works without these)
-	_ = t.SetEnvironment(DeaconSessionName, "GT_ROLE", "deacon")
-	_ = t.SetEnvironment(DeaconSessionName, "BD_ACTOR", "deacon")
+	// Use centralized AgentEnv for consistency across all role startup paths
+	envVars := config.AgentEnv(config.AgentEnvConfig{
+		Role:     "deacon",
+		TownRoot: townRoot,
+	})
+	for k, v := range envVars {
+		_ = t.SetEnvironment(sessionName, k, v)
+	}
 
 	// Apply Deacon theme (non-fatal: theming failure doesn't affect operation)
 	// Note: ConfigureGasTownSession includes cycle bindings
 	theme := tmux.DeaconTheme()
-	_ = t.ConfigureGasTownSession(DeaconSessionName, theme, "", "Deacon", "health-check")
+	_ = t.ConfigureGasTownSession(sessionName, theme, "", "Deacon", "health-check")
 
-	// Launch Claude directly (no shell respawn loop)
-	// Restarts are handled by daemon via ensureDeaconRunning on each heartbeat
-	// The startup hook handles context loading automatically
-	// Export GT_ROLE and BD_ACTOR in the command since tmux SetEnvironment only affects new panes
-	if err := t.SendKeys(DeaconSessionName, config.BuildAgentStartupCommand("deacon", "deacon", "", "")); err != nil {
-		return fmt.Errorf("sending command: %w", err)
-	}
-
-	// Wait for Claude to start (non-fatal)
-	if err := t.WaitForCommand(DeaconSessionName, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
-		// Non-fatal
+	// Wait for Claude to start
+	if err := t.WaitForCommand(sessionName, constants.SupportedShells, constants.ClaudeStartTimeout); err != nil {
+		return fmt.Errorf("waiting for deacon to start: %w", err)
 	}
 	time.Sleep(constants.ShutdownNotifyDelay)
 
+	runtimeConfig := config.LoadRuntimeConfig("")
+	_ = runtime.RunStartupFallback(t, sessionName, "deacon", runtimeConfig)
+
 	// Inject startup nudge for predecessor discovery via /resume
-	_ = session.StartupNudge(t, DeaconSessionName, session.StartupNudgeConfig{
+	if err := session.StartupNudge(t, sessionName, session.StartupNudgeConfig{
 		Recipient: "deacon",
 		Sender:    "daemon",
 		Topic:     "patrol",
-	}) // Non-fatal
+	}); err != nil {
+		style.PrintWarning("failed to send startup nudge: %v", err)
+	}
 
 	// GUPP: Gas Town Universal Propulsion Principle
 	// Send the propulsion nudge to trigger autonomous patrol execution.
 	// Wait for beacon to be fully processed (needs to be separate prompt)
 	time.Sleep(2 * time.Second)
-	_ = t.NudgeSession(DeaconSessionName, session.PropulsionNudgeForRole("deacon")) // Non-fatal
+	if err := t.NudgeSession(sessionName, session.PropulsionNudgeForRole("deacon", deaconDir)); err != nil {
+		return fmt.Errorf("sending propulsion nudge: %w", err)
+	}
 
 	return nil
 }
@@ -363,8 +413,10 @@ func startDeaconSession(t *tmux.Tmux) error {
 func runDeaconStop(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
+	sessionName := getDeaconSessionName()
+
 	// Check if session exists
-	running, err := t.HasSession(DeaconSessionName)
+	running, err := t.HasSession(sessionName)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
@@ -375,11 +427,11 @@ func runDeaconStop(cmd *cobra.Command, args []string) error {
 	fmt.Println("Stopping Deacon session...")
 
 	// Try graceful shutdown first (best-effort interrupt)
-	_ = t.SendKeysRaw(DeaconSessionName, "C-c")
+	_ = t.SendKeysRaw(sessionName, "C-c")
 	time.Sleep(100 * time.Millisecond)
 
 	// Kill the session
-	if err := t.KillSession(DeaconSessionName); err != nil {
+	if err := t.KillSession(sessionName); err != nil {
 		return fmt.Errorf("killing session: %w", err)
 	}
 
@@ -390,35 +442,56 @@ func runDeaconStop(cmd *cobra.Command, args []string) error {
 func runDeaconAttach(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
+	sessionName := getDeaconSessionName()
+
 	// Check if session exists
-	running, err := t.HasSession(DeaconSessionName)
+	running, err := t.HasSession(sessionName)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
 	if !running {
 		// Auto-start if not running
 		fmt.Println("Deacon session not running, starting...")
-		if err := startDeaconSession(t); err != nil {
+		if err := startDeaconSession(t, sessionName, deaconAgentOverride); err != nil {
 			return err
 		}
 	}
 	// Session uses a respawn loop, so Claude restarts automatically if it exits
 
 	// Use shared attach helper (smart: links if inside tmux, attaches if outside)
-	return attachToTmuxSession(DeaconSessionName)
+	return attachToTmuxSession(sessionName)
 }
 
 func runDeaconStatus(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
-	running, err := t.HasSession(DeaconSessionName)
+	sessionName := getDeaconSessionName()
+
+	// Check pause state first (most important)
+	townRoot, _ := workspace.FindFromCwdOrError()
+	if townRoot != "" {
+		paused, state, err := deacon.IsPaused(townRoot)
+		if err == nil && paused {
+			fmt.Printf("%s DEACON PAUSED\n", style.Bold.Render("⏸️"))
+			if state.Reason != "" {
+				fmt.Printf("  Reason: %s\n", state.Reason)
+			}
+			fmt.Printf("  Paused at: %s\n", state.PausedAt.Format(time.RFC3339))
+			fmt.Printf("  Paused by: %s\n", state.PausedBy)
+			fmt.Println()
+			fmt.Printf("Resume with: %s\n", style.Dim.Render("gt deacon resume"))
+			fmt.Println()
+		}
+	}
+
+	running, err := t.HasSession(sessionName)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
 
 	if running {
 		// Get session info for more details
-		info, err := t.GetSessionInfo(DeaconSessionName)
+		info, err := t.GetSessionInfo(sessionName)
 		if err == nil {
 			status := "detached"
 			if info.Attached {
@@ -448,7 +521,9 @@ func runDeaconStatus(cmd *cobra.Command, args []string) error {
 func runDeaconRestart(cmd *cobra.Command, args []string) error {
 	t := tmux.NewTmux()
 
-	running, err := t.HasSession(DeaconSessionName)
+	sessionName := getDeaconSessionName()
+
+	running, err := t.HasSession(sessionName)
 	if err != nil {
 		return fmt.Errorf("checking session: %w", err)
 	}
@@ -457,7 +532,7 @@ func runDeaconRestart(cmd *cobra.Command, args []string) error {
 
 	if running {
 		// Kill existing session
-		if err := t.KillSession(DeaconSessionName); err != nil {
+		if err := t.KillSession(sessionName); err != nil {
 			style.PrintWarning("failed to kill session: %v", err)
 		}
 	}
@@ -476,6 +551,19 @@ func runDeaconHeartbeat(cmd *cobra.Command, args []string) error {
 	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Check if Deacon is paused - if so, refuse to update heartbeat
+	paused, state, err := deacon.IsPaused(townRoot)
+	if err != nil {
+		return fmt.Errorf("checking pause state: %w", err)
+	}
+	if paused {
+		fmt.Printf("%s Deacon is paused. Use 'gt deacon resume' to unpause.\n", style.Bold.Render("⏸️"))
+		if state.Reason != "" {
+			fmt.Printf("  Reason: %s\n", state.Reason)
+		}
+		return errors.New("Deacon is paused")
 	}
 
 	action := ""
@@ -554,64 +642,6 @@ func runDeaconTriggerPending(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// ensurePatrolHooks creates .claude/settings.json with hooks for patrol roles.
-// This is idempotent - if hooks already exist, it does nothing.
-func ensurePatrolHooks(workspacePath string) error {
-	settingsPath := filepath.Join(workspacePath, ".claude", "settings.json")
-
-	// Check if already exists
-	if _, err := os.Stat(settingsPath); err == nil {
-		return nil // Already exists
-	}
-
-	claudeDir := filepath.Join(workspacePath, ".claude")
-	if err := os.MkdirAll(claudeDir, 0755); err != nil {
-		return fmt.Errorf("creating .claude dir: %w", err)
-	}
-
-	// Standard patrol hooks
-	// Note: SessionStart nudges Deacon for GUPP backstop (agent wake notification)
-	hooksJSON := `{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "gt prime && gt mail check --inject && gt nudge deacon session-started"
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "gt prime"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "gt mail check --inject"
-          }
-        ]
-      }
-    ]
-  }
-}
-`
-	return os.WriteFile(settingsPath, []byte(hooksJSON), 0600)
-}
-
 // runDeaconHealthCheck implements the health-check command.
 // It sends a HEALTH_CHECK nudge to an agent, waits for response, and tracks state.
 func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
@@ -673,25 +703,35 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Sent HEALTH_CHECK to %s, waiting %s...\n",
 		style.Bold.Render("→"), agent, healthCheckTimeout)
 
-	// Wait for response
-	deadline := time.Now().Add(healthCheckTimeout)
+	// Wait for response using context and ticker for reliability
+	// This prevents loop hangs if system clock changes
+	ctx, cancel := context.WithTimeout(context.Background(), healthCheckTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
 	responded := false
 
-	for time.Now().Before(deadline) {
-		time.Sleep(2 * time.Second) // Check every 2 seconds
+	for {
+		select {
+		case <-ctx.Done():
+			goto Done
+		case <-ticker.C:
+			newTime, err := getAgentBeadUpdateTime(townRoot, beadID)
+			if err != nil {
+				continue
+			}
 
-		newTime, err := getAgentBeadUpdateTime(townRoot, beadID)
-		if err != nil {
-			continue
-		}
-
-		// If bead was updated after our baseline, agent responded
-		if newTime.After(baselineTime) {
-			responded = true
-			break
+			// If bead was updated after our baseline, agent responded
+			if newTime.After(baselineTime) {
+				responded = true
+				goto Done
+			}
 		}
 	}
 
+Done:
 	// Record result
 	if responded {
 		agentState.RecordResponse()
@@ -852,266 +892,15 @@ func runDeaconHealthState(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// runDeaconZombieScan scans for idle polecats that should have been nuked by the Witness.
-// This is a defense-in-depth backup check.
-func runDeaconZombieScan(cmd *cobra.Command, args []string) error {
-	townRoot, err := workspace.FindFromCwdOrError()
-	if err != nil {
-		return fmt.Errorf("not in a Gas Town workspace: %w", err)
-	}
-
-	t := tmux.NewTmux()
-
-	// Get list of rigs to scan
-	var rigsToScan []string
-	if len(args) > 0 {
-		rigsToScan = []string{args[0]}
-	} else {
-		// Scan all rigs by finding directories with polecats/ subdirectories
-		entries, err := os.ReadDir(townRoot)
-		if err != nil {
-			return fmt.Errorf("reading town root: %w", err)
-		}
-		for _, entry := range entries {
-			if !entry.IsDir() {
-				continue
-			}
-			// Skip non-rig directories
-			if entry.Name() == "deacon" || entry.Name() == "mayor" ||
-				entry.Name() == "plugins" || entry.Name() == "docs" ||
-				strings.HasPrefix(entry.Name(), ".") {
-				continue
-			}
-			// Check if it has a polecats directory
-			polecatsDir := filepath.Join(townRoot, entry.Name(), "polecats")
-			if info, err := os.Stat(polecatsDir); err == nil && info.IsDir() {
-				rigsToScan = append(rigsToScan, entry.Name())
-			}
-		}
-	}
-
-	if len(rigsToScan) == 0 {
-		fmt.Printf("%s No rigs found to scan\n", style.Dim.Render("○"))
-		return nil
-	}
-
-	fmt.Printf("%s Scanning for zombie polecats (threshold: %s)...\n",
-		style.Bold.Render("🧟"), zombieScanThreshold)
-
-	var zombies []zombieInfo
-	for _, rigName := range rigsToScan {
-		rigZombies, err := scanRigForZombies(townRoot, rigName, t)
-		if err != nil {
-			style.PrintWarning("failed to scan rig %s: %v", rigName, err)
-			continue
-		}
-		zombies = append(zombies, rigZombies...)
-	}
-
-	if len(zombies) == 0 {
-		fmt.Printf("%s No zombies found (all polecats healthy)\n", style.Bold.Render("✓"))
-		return nil
-	}
-
-	// Report zombies
-	fmt.Printf("\n%s Found %d zombie(s):\n\n", style.Bold.Render("⚠"), len(zombies))
-	for _, z := range zombies {
-		fmt.Printf("  %s %s/%s\n", style.Dim.Render("🧟"), z.rig, z.name)
-		fmt.Printf("    State: %s, Session: %s\n", z.state, z.sessionStatus)
-		fmt.Printf("    Hooked work: %s\n", z.hookedWork)
-		fmt.Printf("    Last activity: %s ago\n", z.staleness.Round(time.Second))
-		fmt.Printf("    Reason: %s\n", z.reason)
-		fmt.Println()
-	}
-
-	// Nuke zombies if enabled
-	if zombieScanNuke && !zombieScanDryRun {
-		fmt.Printf("%s Nuking zombies...\n", style.Bold.Render("💀"))
-		for _, z := range zombies {
-			if err := nukeZombie(townRoot, z, t); err != nil {
-				style.PrintWarning("failed to nuke %s/%s: %v", z.rig, z.name, err)
-			} else {
-				fmt.Printf("  %s Nuked %s/%s\n", style.Bold.Render("✓"), z.rig, z.name)
-			}
-		}
-
-		// Notify mayor about witness failure
-		notifyMayorOfWitnessFailure(townRoot, zombies)
-	} else if zombieScanDryRun {
-		fmt.Printf("%s Dry run - would nuke %d zombie(s)\n", style.Dim.Render("ℹ"), len(zombies))
-	}
-
-	return nil
-}
-
-// zombieInfo holds information about a detected zombie polecat.
-type zombieInfo struct {
-	rig           string
-	name          string
-	state         string
-	sessionStatus string
-	hookedWork    string
-	staleness     time.Duration
-	reason        string
-	sessionName   string
-}
-
-// scanRigForZombies scans a rig for zombie polecats.
-func scanRigForZombies(townRoot, rigName string, t *tmux.Tmux) ([]zombieInfo, error) {
-	rigPath := filepath.Join(townRoot, rigName)
-	polecatsDir := filepath.Join(rigPath, "polecats")
-
-	entries, err := os.ReadDir(polecatsDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil // No polecats dir
-		}
-		return nil, err
-	}
-
-	var zombies []zombieInfo
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-
-		// Build session name for this polecat
-		sessionName := fmt.Sprintf("gt-%s-%s", rigName, name)
-
-		// Check if session is running
-		sessionRunning, _ := t.HasSession(sessionName)
-
-		// Check for hooked work
-		hookedWork := checkPolecatHookedWork(townRoot, rigName, name)
-
-		// Get last activity time from polecat directory
-		polecatPath := filepath.Join(polecatsDir, name)
-		staleness := getPolecatStaleness(polecatPath)
-
-		// Determine if this is a zombie
-		state := "unknown"
-		if sessionRunning {
-			state = "session_running"
-			continue // Not a zombie if session is running
-		}
-		state = "session_dead"
-
-		// Check all zombie criteria
-		if hookedWork != "" {
-			// Has hooked work - not a zombie (just needs to be started)
-			continue
-		}
-
-		if staleness < zombieScanThreshold {
-			// Recently active - not stale enough
-			continue
-		}
-
-		// This is a zombie
-		zombies = append(zombies, zombieInfo{
-			rig:           rigName,
-			name:          name,
-			state:         state,
-			sessionStatus: "not running",
-			hookedWork:    "none",
-			staleness:     staleness,
-			reason:        fmt.Sprintf("idle for %s with no session or hooked work", staleness.Round(time.Minute)),
-			sessionName:   sessionName,
-		})
-	}
-
-	return zombies, nil
-}
-
-// checkPolecatHookedWork checks if a polecat has hooked work.
-func checkPolecatHookedWork(townRoot, rigName, polecatName string) string {
-	// Query beads for hooked issues assigned to this polecat
-	assignee := fmt.Sprintf("%s/polecats/%s", rigName, polecatName)
-	cmd := exec.Command("bd", "list", "--status=hooked", "--assignee="+assignee, "--json")
-	cmd.Dir = townRoot
-
-	output, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-
-	var issues []struct {
-		ID    string `json:"id"`
-		Title string `json:"title"`
-	}
-	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
-		return ""
-	}
-
-	return issues[0].ID
-}
-
-// getPolecatStaleness returns how long since the polecat was last active.
-func getPolecatStaleness(polecatPath string) time.Duration {
-	// Check .beads/last-touched if it exists
-	lastTouchedPath := filepath.Join(polecatPath, ".beads", "last-touched")
-	if info, err := os.Stat(lastTouchedPath); err == nil {
-		return time.Since(info.ModTime())
-	}
-
-	// Fall back to directory modification time
-	if info, err := os.Stat(polecatPath); err == nil {
-		return time.Since(info.ModTime())
-	}
-
-	// Very stale if we can't determine
-	return 24 * time.Hour
-}
-
-// nukeZombie cleans up a zombie polecat.
-func nukeZombie(townRoot string, z zombieInfo, t *tmux.Tmux) error {
-	// Step 1: Kill tmux session if somehow still exists
-	if exists, _ := t.HasSession(z.sessionName); exists {
-		_ = t.KillSession(z.sessionName)
-	}
-
-	// Step 2: Run gt polecat nuke to clean up
-	cmd := exec.Command("gt", "polecat", "nuke", z.name, "--rig="+z.rig, "--force")
-	cmd.Dir = townRoot
-	if err := cmd.Run(); err != nil {
-		// Non-fatal - polecat might already be cleaned up
-		style.PrintWarning("polecat nuke returned error (may be already cleaned): %v", err)
-	}
-
-	return nil
-}
-
-// notifyMayorOfWitnessFailure notifies the mayor about witness cleanup failures.
-func notifyMayorOfWitnessFailure(townRoot string, zombies []zombieInfo) {
-	if len(zombies) == 0 {
-		return
-	}
-
-	// Group by rig
-	rigCounts := make(map[string]int)
-	for _, z := range zombies {
-		rigCounts[z.rig]++
-	}
-
-	var details strings.Builder
-	details.WriteString("Deacon detected zombie polecats that Witness should have cleaned:\n\n")
-	for rig, count := range rigCounts {
-		details.WriteString(fmt.Sprintf("- %s: %d zombie(s)\n", rig, count))
-	}
-	details.WriteString("\nDeacon has nuked them directly. Check Witness health.")
-
-	sendMail(townRoot, "mayor/", "⚠️ Witness cleanup failure detected", details.String())
-}
-
 // agentAddressToIDs converts an agent address to bead ID and session name.
 // Supports formats: "gastown/polecats/max", "gastown/witness", "deacon", "mayor"
+// Note: Town-level agents (Mayor, Deacon) use hq- prefix bead IDs stored in town beads.
 func agentAddressToIDs(address string) (beadID, sessionName string, err error) {
 	switch address {
 	case "deacon":
-		return "gt-deacon", DeaconSessionName, nil
+		return beads.DeaconBeadIDTown(), session.DeaconSessionName(), nil
 	case "mayor":
-		return "gt-mayor", "gt-mayor", nil
+		return beads.MayorBeadIDTown(), session.MayorSessionName(), nil
 	}
 
 	parts := strings.Split(address, "/")
@@ -1175,7 +964,7 @@ func sendMail(townRoot, to, subject, body string) {
 }
 
 // updateAgentBeadState updates an agent bead's state.
-func updateAgentBeadState(townRoot, agent, state, reason string) {
+func updateAgentBeadState(townRoot, agent, state, _ string) { // reason unused but kept for API consistency
 	beadID, _, err := agentAddressToIDs(agent)
 	if err != nil {
 		return
@@ -1187,3 +976,132 @@ func updateAgentBeadState(townRoot, agent, state, reason string) {
 	_ = cmd.Run() // Best effort
 }
 
+// runDeaconStaleHooks finds and unhooks stale hooked beads.
+func runDeaconStaleHooks(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	cfg := &deacon.StaleHookConfig{
+		MaxAge: staleHooksMaxAge,
+		DryRun: staleHooksDryRun,
+	}
+
+	result, err := deacon.ScanStaleHooks(townRoot, cfg)
+	if err != nil {
+		return fmt.Errorf("scanning stale hooks: %w", err)
+	}
+
+	// Print summary
+	if result.TotalHooked == 0 {
+		fmt.Printf("%s No hooked beads found\n", style.Dim.Render("○"))
+		return nil
+	}
+
+	fmt.Printf("%s Found %d hooked bead(s), %d stale (older than %s)\n",
+		style.Bold.Render("●"), result.TotalHooked, result.StaleCount, staleHooksMaxAge)
+
+	if result.StaleCount == 0 {
+		fmt.Printf("%s No stale hooked beads\n", style.Dim.Render("○"))
+		return nil
+	}
+
+	// Print details for each stale bead
+	for _, r := range result.Results {
+		status := style.Dim.Render("○")
+		action := "skipped (agent alive)"
+
+		if !r.AgentAlive {
+			if staleHooksDryRun {
+				status = style.Bold.Render("?")
+				action = "would unhook (agent dead)"
+			} else if r.Unhooked {
+				status = style.Bold.Render("✓")
+				action = "unhooked (agent dead)"
+			} else if r.Error != "" {
+				status = style.Dim.Render("✗")
+				action = fmt.Sprintf("error: %s", r.Error)
+			}
+		}
+
+		fmt.Printf("  %s %s: %s (age: %s, assignee: %s)\n",
+			status, r.BeadID, action, r.Age, r.Assignee)
+	}
+
+	// Summary
+	if staleHooksDryRun {
+		fmt.Printf("\n%s Dry run - no changes made. Run without --dry-run to unhook.\n",
+			style.Dim.Render("ℹ"))
+	} else if result.Unhooked > 0 {
+		fmt.Printf("\n%s Unhooked %d stale bead(s)\n",
+			style.Bold.Render("✓"), result.Unhooked)
+	}
+
+	return nil
+}
+
+// runDeaconPause pauses the Deacon to prevent patrol actions.
+func runDeaconPause(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Check if already paused
+	paused, state, err := deacon.IsPaused(townRoot)
+	if err != nil {
+		return fmt.Errorf("checking pause state: %w", err)
+	}
+	if paused {
+		fmt.Printf("%s Deacon is already paused\n", style.Dim.Render("○"))
+		fmt.Printf("  Reason: %s\n", state.Reason)
+		fmt.Printf("  Paused at: %s\n", state.PausedAt.Format(time.RFC3339))
+		fmt.Printf("  Paused by: %s\n", state.PausedBy)
+		return nil
+	}
+
+	// Pause the Deacon
+	if err := deacon.Pause(townRoot, pauseReason, "human"); err != nil {
+		return fmt.Errorf("pausing Deacon: %w", err)
+	}
+
+	fmt.Printf("%s Deacon paused\n", style.Bold.Render("⏸️"))
+	if pauseReason != "" {
+		fmt.Printf("  Reason: %s\n", pauseReason)
+	}
+	fmt.Printf("  Pause file: %s\n", deacon.GetPauseFile(townRoot))
+	fmt.Println()
+	fmt.Printf("The Deacon will not perform any patrol actions until resumed.\n")
+	fmt.Printf("Resume with: %s\n", style.Dim.Render("gt deacon resume"))
+
+	return nil
+}
+
+// runDeaconResume resumes the Deacon to allow patrol actions.
+func runDeaconResume(cmd *cobra.Command, args []string) error {
+	townRoot, err := workspace.FindFromCwdOrError()
+	if err != nil {
+		return fmt.Errorf("not in a Gas Town workspace: %w", err)
+	}
+
+	// Check if paused
+	paused, _, err := deacon.IsPaused(townRoot)
+	if err != nil {
+		return fmt.Errorf("checking pause state: %w", err)
+	}
+	if !paused {
+		fmt.Printf("%s Deacon is not paused\n", style.Dim.Render("○"))
+		return nil
+	}
+
+	// Resume the Deacon
+	if err := deacon.Resume(townRoot); err != nil {
+		return fmt.Errorf("resuming Deacon: %w", err)
+	}
+
+	fmt.Printf("%s Deacon resumed\n", style.Bold.Render("▶️"))
+	fmt.Println("The Deacon can now perform patrol actions.")
+
+	return nil
+}

@@ -33,7 +33,6 @@ func TestInstallCreatesCorrectStructure(t *testing.T) {
 	// Verify directory structure
 	assertDirExists(t, hqPath, "HQ root")
 	assertDirExists(t, filepath.Join(hqPath, "mayor"), "mayor/")
-	assertDirExists(t, filepath.Join(hqPath, "rigs"), "rigs/")
 
 	// Verify mayor/town.json
 	townPath := filepath.Join(hqPath, "mayor", "town.json")
@@ -62,25 +61,18 @@ func TestInstallCreatesCorrectStructure(t *testing.T) {
 		t.Errorf("rigs.json should be empty, got %d rigs", len(rigsConfig.Rigs))
 	}
 
-	// Verify mayor/state.json
-	statePath := filepath.Join(hqPath, "mayor", "state.json")
-	assertFileExists(t, statePath, "mayor/state.json")
+	// Verify CLAUDE.md exists in mayor/ (not town root, to avoid inheritance pollution)
+	claudePath := filepath.Join(hqPath, "mayor", "CLAUDE.md")
+	assertFileExists(t, claudePath, "mayor/CLAUDE.md")
 
-	stateData, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatalf("failed to read state.json: %v", err)
-	}
-	var state map[string]interface{}
-	if err := json.Unmarshal(stateData, &state); err != nil {
-		t.Fatalf("failed to parse state.json: %v", err)
-	}
-	if state["role"] != "mayor" {
-		t.Errorf("state.json role = %q, want %q", state["role"], "mayor")
-	}
+	// Verify Claude settings exist in mayor/.claude/ (not town root/.claude/)
+	// Mayor settings go here to avoid polluting child workspaces via directory traversal
+	mayorSettingsPath := filepath.Join(hqPath, "mayor", ".claude", "settings.json")
+	assertFileExists(t, mayorSettingsPath, "mayor/.claude/settings.json")
 
-	// Verify CLAUDE.md exists
-	claudePath := filepath.Join(hqPath, "CLAUDE.md")
-	assertFileExists(t, claudePath, "CLAUDE.md")
+	// Verify deacon settings exist in deacon/.claude/
+	deaconSettingsPath := filepath.Join(hqPath, "deacon", ".claude", "settings.json")
+	assertFileExists(t, deaconSettingsPath, "deacon/.claude/settings.json")
 }
 
 // TestInstallBeadsHasCorrectPrefix validates that beads is initialized
@@ -130,6 +122,46 @@ func TestInstallBeadsHasCorrectPrefix(t *testing.T) {
 	}
 }
 
+// TestInstallTownRoleSlots validates that town-level agent beads
+// have their role slot set after install.
+func TestInstallTownRoleSlots(t *testing.T) {
+	// Skip if bd is not available
+	if _, err := exec.LookPath("bd"); err != nil {
+		t.Skip("bd not installed, skipping role slot test")
+	}
+
+	tmpDir := t.TempDir()
+	hqPath := filepath.Join(tmpDir, "test-hq")
+
+	gtBinary := buildGT(t)
+
+	// Run gt install (includes beads init by default)
+	cmd := exec.Command(gtBinary, "install", hqPath)
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
+	}
+
+	// Log install output for CI debugging
+	t.Logf("gt install output:\n%s", output)
+
+	// Verify beads directory was created
+	beadsDir := filepath.Join(hqPath, ".beads")
+	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+		t.Fatalf("beads directory not created at %s", beadsDir)
+	}
+
+	// List beads for debugging
+	listCmd := exec.Command("bd", "--no-daemon", "list", "--type=agent")
+	listCmd.Dir = hqPath
+	listOutput, _ := listCmd.CombinedOutput()
+	t.Logf("bd list --type=agent output:\n%s", listOutput)
+
+	assertSlotValue(t, hqPath, "hq-mayor", "role", "hq-mayor-role")
+	assertSlotValue(t, hqPath, "hq-deacon", "role", "hq-deacon-role")
+}
+
 // TestInstallIdempotent validates that running gt install twice
 // on the same directory fails without --force flag.
 func TestInstallIdempotent(t *testing.T) {
@@ -161,6 +193,115 @@ func TestInstallIdempotent(t *testing.T) {
 	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("install with --force failed: %v\nOutput: %s", err, output)
+	}
+}
+
+// TestInstallFormulasProvisioned validates that embedded formulas are copied
+// to .beads/formulas/ during installation.
+func TestInstallFormulasProvisioned(t *testing.T) {
+	// Skip if bd is not available
+	if _, err := exec.LookPath("bd"); err != nil {
+		t.Skip("bd not installed, skipping formulas test")
+	}
+
+	tmpDir := t.TempDir()
+	hqPath := filepath.Join(tmpDir, "test-hq")
+
+	gtBinary := buildGT(t)
+
+	// Run gt install (includes beads and formula provisioning)
+	cmd := exec.Command(gtBinary, "install", hqPath)
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify .beads/formulas/ directory exists
+	formulasDir := filepath.Join(hqPath, ".beads", "formulas")
+	assertDirExists(t, formulasDir, ".beads/formulas/")
+
+	// Verify at least some expected formulas exist
+	expectedFormulas := []string{
+		"mol-deacon-patrol.formula.toml",
+		"mol-refinery-patrol.formula.toml",
+		"code-review.formula.toml",
+	}
+	for _, f := range expectedFormulas {
+		formulaPath := filepath.Join(formulasDir, f)
+		assertFileExists(t, formulaPath, f)
+	}
+
+	// Verify the count matches embedded formulas
+	entries, err := os.ReadDir(formulasDir)
+	if err != nil {
+		t.Fatalf("failed to read formulas dir: %v", err)
+	}
+	// Count only formula files (not directories)
+	var fileCount int
+	for _, e := range entries {
+		if !e.IsDir() {
+			fileCount++
+		}
+	}
+	// Should have at least 20 formulas (allows for some variation)
+	if fileCount < 20 {
+		t.Errorf("expected at least 20 formulas, got %d", fileCount)
+	}
+}
+
+// TestInstallWrappersInExistingTown validates that --wrappers works in an
+// existing town without requiring --force or recreating HQ structure.
+func TestInstallWrappersInExistingTown(t *testing.T) {
+	tmpDir := t.TempDir()
+	hqPath := filepath.Join(tmpDir, "test-hq")
+	binDir := filepath.Join(tmpDir, "bin")
+
+	// Create bin directory for wrappers
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("failed to create bin dir: %v", err)
+	}
+
+	gtBinary := buildGT(t)
+
+	// First: create HQ without wrappers
+	cmd := exec.Command(gtBinary, "install", hqPath, "--no-beads")
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("first install failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify town.json exists (proves HQ was created)
+	townPath := filepath.Join(hqPath, "mayor", "town.json")
+	assertFileExists(t, townPath, "mayor/town.json")
+
+	// Get modification time of town.json before wrapper install
+	townInfo, err := os.Stat(townPath)
+	if err != nil {
+		t.Fatalf("failed to stat town.json: %v", err)
+	}
+	townModBefore := townInfo.ModTime()
+
+	// Second: install --wrappers in same directory (should not recreate HQ)
+	cmd = exec.Command(gtBinary, "install", hqPath, "--wrappers")
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install --wrappers in existing town failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify town.json was NOT modified (HQ was not recreated)
+	townInfo, err = os.Stat(townPath)
+	if err != nil {
+		t.Fatalf("failed to stat town.json after wrapper install: %v", err)
+	}
+	if townInfo.ModTime() != townModBefore {
+		t.Errorf("town.json was modified during --wrappers install, HQ should not be recreated")
+	}
+
+	// Verify output mentions wrapper installation
+	if !strings.Contains(string(output), "gt-codex") && !strings.Contains(string(output), "gt-opencode") {
+		t.Errorf("expected output to mention wrappers, got: %s", output)
 	}
 }
 
@@ -257,5 +398,33 @@ func assertFileExists(t *testing.T, path, name string) {
 	}
 	if info.IsDir() {
 		t.Errorf("%s is a directory, expected file", name)
+	}
+}
+
+func assertSlotValue(t *testing.T, townRoot, issueID, slot, want string) {
+	t.Helper()
+	cmd := exec.Command("bd", "--no-daemon", "--json", "slot", "show", issueID)
+	cmd.Dir = townRoot
+	output, err := cmd.Output()
+	if err != nil {
+		debugCmd := exec.Command("bd", "--no-daemon", "--json", "slot", "show", issueID)
+		debugCmd.Dir = townRoot
+		combined, _ := debugCmd.CombinedOutput()
+		t.Fatalf("bd slot show %s failed: %v\nOutput: %s", issueID, err, combined)
+	}
+
+	var parsed struct {
+		Slots map[string]*string `json:"slots"`
+	}
+	if err := json.Unmarshal(output, &parsed); err != nil {
+		t.Fatalf("parsing slot show output failed: %v\nOutput: %s", err, output)
+	}
+
+	var got string
+	if value, ok := parsed.Slots[slot]; ok && value != nil {
+		got = *value
+	}
+	if got != want {
+		t.Fatalf("slot %s for %s = %q, want %q", slot, issueID, got, want)
 	}
 }

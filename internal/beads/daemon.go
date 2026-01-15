@@ -5,7 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
+	"strings"
 	"time"
+)
+
+const (
+	gracefulTimeout = 2 * time.Second
 )
 
 // BdDaemonInfo represents the status of a single bd daemon instance.
@@ -69,21 +75,12 @@ func EnsureBdDaemonHealth(workDir string) string {
 
 	// Check if any daemons need attention
 	needsRestart := false
-	var issues []string
-
 	for _, d := range health.Daemons {
 		switch d.Status {
 		case "healthy":
 			// Good
-		case "version_mismatch":
+		case "version_mismatch", "stale", "unresponsive":
 			needsRestart = true
-			issues = append(issues, fmt.Sprintf("%s: version mismatch", d.Workspace))
-		case "stale":
-			needsRestart = true
-			issues = append(issues, fmt.Sprintf("%s: stale", d.Workspace))
-		case "unresponsive":
-			needsRestart = true
-			issues = append(issues, fmt.Sprintf("%s: unresponsive", d.Workspace))
 		}
 	}
 
@@ -111,10 +108,9 @@ func EnsureBdDaemonHealth(workDir string) string {
 }
 
 // restartBdDaemons restarts all bd daemons.
-func restartBdDaemons() error {
-	// Stop all daemons first
-	stopCmd := exec.Command("bd", "daemon", "killall")
-	stopCmd.Run() // Ignore errors - daemons might not be running
+func restartBdDaemons() error { //nolint:unparam // error return kept for future use
+	// Stop all daemons first using pkill to avoid auto-start side effects
+	_ = exec.Command("pkill", "-TERM", "-f", "bd daemon").Run()
 
 	// Give time for cleanup
 	time.Sleep(200 * time.Millisecond)
@@ -131,4 +127,118 @@ func StartBdDaemonIfNeeded(workDir string) error {
 	cmd := exec.Command("bd", "daemon", "--start")
 	cmd.Dir = workDir
 	return cmd.Run()
+}
+
+// StopAllBdProcesses stops all bd daemon and activity processes.
+// Returns (daemonsKilled, activityKilled, error).
+// If dryRun is true, returns counts without stopping anything.
+func StopAllBdProcesses(dryRun, force bool) (int, int, error) {
+	if _, err := exec.LookPath("bd"); err != nil {
+		return 0, 0, nil
+	}
+
+	daemonsBefore := CountBdDaemons()
+	activityBefore := CountBdActivityProcesses()
+
+	if dryRun {
+		return daemonsBefore, activityBefore, nil
+	}
+
+	daemonsKilled, daemonsRemaining := stopBdDaemons(force)
+	activityKilled, activityRemaining := stopBdActivityProcesses(force)
+
+	if daemonsRemaining > 0 {
+		return daemonsKilled, activityKilled, fmt.Errorf("bd daemon shutdown incomplete: %d still running", daemonsRemaining)
+	}
+	if activityRemaining > 0 {
+		return daemonsKilled, activityKilled, fmt.Errorf("bd activity shutdown incomplete: %d still running", activityRemaining)
+	}
+
+	return daemonsKilled, activityKilled, nil
+}
+
+// CountBdDaemons returns count of running bd daemons.
+// Uses pgrep instead of "bd daemon list" to avoid triggering daemon auto-start
+// during shutdown verification.
+func CountBdDaemons() int {
+	// Use pgrep -f with wc -l for cross-platform compatibility
+	// (macOS pgrep doesn't support -c flag)
+	cmd := exec.Command("sh", "-c", "pgrep -f 'bd daemon' 2>/dev/null | wc -l")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	count, _ := strconv.Atoi(strings.TrimSpace(string(output)))
+	return count
+}
+
+
+func stopBdDaemons(force bool) (int, int) {
+	before := CountBdDaemons()
+	if before == 0 {
+		return 0, 0
+	}
+
+	// Use pkill directly instead of "bd daemon killall" to avoid triggering
+	// daemon auto-start as a side effect of running bd commands.
+	// Note: pkill -f pattern may match unintended processes in rare cases
+	// (e.g., editors with "bd daemon" in file content). This is acceptable
+	// given the alternative of respawning daemons during shutdown.
+	if force {
+		_ = exec.Command("pkill", "-9", "-f", "bd daemon").Run()
+	} else {
+		_ = exec.Command("pkill", "-TERM", "-f", "bd daemon").Run()
+		time.Sleep(gracefulTimeout)
+		if remaining := CountBdDaemons(); remaining > 0 {
+			_ = exec.Command("pkill", "-9", "-f", "bd daemon").Run()
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	final := CountBdDaemons()
+	killed := before - final
+	if killed < 0 {
+		killed = 0 // Race condition: more processes spawned than we killed
+	}
+	return killed, final
+}
+
+// CountBdActivityProcesses returns count of running `bd activity` processes.
+func CountBdActivityProcesses() int {
+	// Use pgrep -f with wc -l for cross-platform compatibility
+	// (macOS pgrep doesn't support -c flag)
+	cmd := exec.Command("sh", "-c", "pgrep -f 'bd activity' 2>/dev/null | wc -l")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	count, _ := strconv.Atoi(strings.TrimSpace(string(output)))
+	return count
+}
+
+func stopBdActivityProcesses(force bool) (int, int) {
+	before := CountBdActivityProcesses()
+	if before == 0 {
+		return 0, 0
+	}
+
+	if force {
+		_ = exec.Command("pkill", "-9", "-f", "bd activity").Run()
+	} else {
+		_ = exec.Command("pkill", "-TERM", "-f", "bd activity").Run()
+		time.Sleep(gracefulTimeout)
+		if remaining := CountBdActivityProcesses(); remaining > 0 {
+			_ = exec.Command("pkill", "-9", "-f", "bd activity").Run()
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	after := CountBdActivityProcesses()
+	killed := before - after
+	if killed < 0 {
+		killed = 0 // Race condition: more processes spawned than we killed
+	}
+	return killed, after
 }

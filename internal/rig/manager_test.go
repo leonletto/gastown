@@ -3,6 +3,7 @@ package rig
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -32,6 +33,23 @@ func writeFakeBD(t *testing.T, script string) string {
 	return binDir
 }
 
+func assertBeadsDirLog(t *testing.T, logPath, want string) {
+	t.Helper()
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading beads dir log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
+		t.Fatalf("expected beads dir log entries, got none")
+	}
+	for _, line := range lines {
+		if line != want {
+			t.Fatalf("BEADS_DIR = %q, want %q", line, want)
+		}
+	}
+}
+
 func createTestRig(t *testing.T, root, name string) {
 	t.Helper()
 
@@ -40,18 +58,12 @@ func createTestRig(t *testing.T, root, name string) {
 		t.Fatalf("mkdir rig: %v", err)
 	}
 
-	// Create agent dirs
+	// Create agent dirs (witness, refinery, mayor)
 	for _, dir := range AgentDirs {
 		dirPath := filepath.Join(rigPath, dir)
 		if err := os.MkdirAll(dirPath, 0755); err != nil {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
-	}
-
-	// Create witness state.json (witnesses don't have clones, just state)
-	witnessState := filepath.Join(rigPath, "witness", "state.json")
-	if err := os.WriteFile(witnessState, []byte(`{"role":"witness"}`), 0644); err != nil {
-		t.Fatalf("write witness state: %v", err)
 	}
 
 	// Create some polecats
@@ -60,6 +72,10 @@ func createTestRig(t *testing.T, root, name string) {
 		if err := os.MkdirAll(filepath.Join(polecatsDir, polecat), 0755); err != nil {
 			t.Fatalf("mkdir polecat: %v", err)
 		}
+	}
+	// Create a shared support dir that should not be treated as a polecat worktree.
+	if err := os.MkdirAll(filepath.Join(polecatsDir, ".claude"), 0755); err != nil {
+		t.Fatalf("mkdir polecats/.claude: %v", err)
 	}
 }
 
@@ -89,6 +105,9 @@ func TestDiscoverRigs(t *testing.T) {
 	}
 	if len(rig.Polecats) != 2 {
 		t.Errorf("Polecats count = %d, want 2", len(rig.Polecats))
+	}
+	if slices.Contains(rig.Polecats, ".claude") {
+		t.Errorf("expected polecats/.claude to be ignored, got %v", rig.Polecats)
 	}
 	if !rig.HasWitness {
 		t.Error("expected HasWitness = true")
@@ -294,12 +313,98 @@ func TestEnsureGitignoreEntry_AppendsToExisting(t *testing.T) {
 	}
 }
 
+func TestInitBeads_TrackedBeads_CreatesRedirect(t *testing.T) {
+	t.Parallel()
+	// When the cloned repo has tracked beads (mayor/rig/.beads exists),
+	// initBeads should create a redirect file at <rig>/.beads/redirect
+	// pointing to mayor/rig/.beads instead of creating a local database.
+	rigPath := t.TempDir()
+
+	// Simulate tracked beads in the cloned repo
+	mayorBeadsDir := filepath.Join(rigPath, "mayor", "rig", ".beads")
+	if err := os.MkdirAll(mayorBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor beads: %v", err)
+	}
+	// Create a config file to simulate a real beads directory
+	if err := os.WriteFile(filepath.Join(mayorBeadsDir, "config.yaml"), []byte("prefix: gt\n"), 0644); err != nil {
+		t.Fatalf("write mayor config: %v", err)
+	}
+
+	manager := &Manager{}
+	if err := manager.initBeads(rigPath, "gt"); err != nil {
+		t.Fatalf("initBeads: %v", err)
+	}
+
+	// Verify redirect file was created
+	redirectPath := filepath.Join(rigPath, ".beads", "redirect")
+	content, err := os.ReadFile(redirectPath)
+	if err != nil {
+		t.Fatalf("reading redirect file: %v", err)
+	}
+
+	expected := "mayor/rig/.beads\n"
+	if string(content) != expected {
+		t.Errorf("redirect content = %q, want %q", string(content), expected)
+	}
+
+	// Verify no local database was created (no config.yaml at rig level)
+	rigConfigPath := filepath.Join(rigPath, ".beads", "config.yaml")
+	if _, err := os.Stat(rigConfigPath); !os.IsNotExist(err) {
+		t.Errorf("expected no config.yaml at rig level when using redirect, but it exists")
+	}
+}
+
+func TestInitBeads_LocalBeads_CreatesDatabase(t *testing.T) {
+	// Cannot use t.Parallel() due to t.Setenv
+	// When the cloned repo does NOT have tracked beads (no mayor/rig/.beads),
+	// initBeads should create a local database at <rig>/.beads/
+	rigPath := t.TempDir()
+
+	// Create mayor/rig directory but WITHOUT .beads (no tracked beads)
+	mayorRigDir := filepath.Join(rigPath, "mayor", "rig")
+	if err := os.MkdirAll(mayorRigDir, 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	// Use fake bd that succeeds
+	script := `#!/usr/bin/env bash
+set -e
+if [[ "$1" == "init" ]]; then
+  # Simulate successful bd init
+  exit 0
+fi
+exit 0
+`
+	binDir := writeFakeBD(t, script)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := &Manager{}
+	if err := manager.initBeads(rigPath, "gt"); err != nil {
+		t.Fatalf("initBeads: %v", err)
+	}
+
+	// Verify NO redirect file was created
+	redirectPath := filepath.Join(rigPath, ".beads", "redirect")
+	if _, err := os.Stat(redirectPath); !os.IsNotExist(err) {
+		t.Errorf("expected no redirect file for local beads, but it exists")
+	}
+
+	// Verify .beads directory was created
+	beadsDir := filepath.Join(rigPath, ".beads")
+	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+		t.Errorf("expected .beads directory to be created")
+	}
+}
+
 func TestInitBeadsWritesConfigOnFailure(t *testing.T) {
 	rigPath := t.TempDir()
 	beadsDir := filepath.Join(rigPath, ".beads")
 
 	script := `#!/usr/bin/env bash
 set -e
+if [[ -n "$BEADS_DIR_LOG" ]]; then
+  echo "${BEADS_DIR:-<unset>}" >> "$BEADS_DIR_LOG"
+fi
 cmd="$1"
 shift
 if [[ "$cmd" == "init" ]]; then
@@ -311,8 +416,9 @@ exit 1
 `
 
 	binDir := writeFakeBD(t, script)
+	beadsDirLog := filepath.Join(t.TempDir(), "beads-dir.log")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("EXPECT_BEADS_DIR", beadsDir)
+	t.Setenv("BEADS_DIR_LOG", beadsDirLog)
 
 	manager := &Manager{}
 	if err := manager.initBeads(rigPath, "gt"); err != nil {
@@ -327,43 +433,44 @@ exit 1
 	if string(config) != "prefix: gt\n" {
 		t.Fatalf("config.yaml = %q, want %q", string(config), "prefix: gt\n")
 	}
+	assertBeadsDirLog(t, beadsDirLog, beadsDir)
 }
 
-func TestInitAgentBeadsUsesTownBeadsDir(t *testing.T) {
-	// Agent beads use town beads (gt-* prefix) for cross-rig coordination.
-	// The Manager.townRoot determines where agent beads are created.
+func TestInitAgentBeadsUsesRigBeadsDir(t *testing.T) {
+	// Rig-level agent beads (witness, refinery) are stored in rig beads.
+	// Town-level agents (mayor, deacon) are created by gt install in town beads.
+	// This test verifies that rig agent beads are created in the rig directory,
+	// using the resolved rig beads directory for BEADS_DIR.
 	townRoot := t.TempDir()
-	townBeadsDir := filepath.Join(townRoot, ".beads")
 	rigPath := filepath.Join(townRoot, "testrip")
-	mayorRigPath := filepath.Join(rigPath, "mayor", "rig")
+	rigBeadsDir := filepath.Join(rigPath, ".beads")
 
-	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
-		t.Fatalf("mkdir town beads dir: %v", err)
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("mkdir rig beads dir: %v", err)
 	}
-	if err := os.MkdirAll(mayorRigPath, 0755); err != nil {
-		t.Fatalf("mkdir mayor rig: %v", err)
-	}
+
+	// Track which agent IDs were created
+	var createdAgents []string
 
 	script := `#!/usr/bin/env bash
 set -e
+if [[ -n "$BEADS_DIR_LOG" ]]; then
+  echo "${BEADS_DIR:-<unset>}" >> "$BEADS_DIR_LOG"
+fi
 if [[ "$1" == "--no-daemon" ]]; then
+  shift
+fi
+if [[ "$1" == "--allow-stale" ]]; then
   shift
 fi
 cmd="$1"
 shift
 case "$cmd" in
   show)
-    if [[ "$BEADS_DIR" != "$EXPECT_BEADS_DIR" ]]; then
-      echo "BEADS_DIR mismatch" >&2
-      exit 1
-    fi
+    # Return empty to indicate agent doesn't exist yet
     echo "[]"
     ;;
   create)
-    if [[ "$BEADS_DIR" != "$EXPECT_BEADS_DIR" ]]; then
-      echo "BEADS_DIR mismatch" >&2
-      exit 1
-    fi
     id=""
     title=""
     for arg in "$@"; do
@@ -372,13 +479,12 @@ case "$cmd" in
         --title=*) title="${arg#--title=}" ;;
       esac
     done
+    # Log the created agent ID for verification
+    echo "$id" >> "$AGENT_LOG"
     printf '{"id":"%s","title":"%s","description":"","issue_type":"agent"}' "$id" "$title"
     ;;
   slot)
-    if [[ "$BEADS_DIR" != "$EXPECT_BEADS_DIR" ]]; then
-      echo "BEADS_DIR mismatch" >&2
-      exit 1
-    fi
+    # Accept slot commands
     ;;
   *)
     echo "unexpected command: $cmd" >&2
@@ -388,12 +494,199 @@ esac
 `
 
 	binDir := writeFakeBD(t, script)
+	agentLog := filepath.Join(t.TempDir(), "agents.log")
+	beadsDirLog := filepath.Join(t.TempDir(), "beads-dir.log")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("EXPECT_BEADS_DIR", townBeadsDir)
-	t.Setenv("BEADS_DIR", "")
+	t.Setenv("AGENT_LOG", agentLog)
+	t.Setenv("BEADS_DIR_LOG", beadsDirLog)
+	t.Setenv("BEADS_DIR", "") // Clear any existing BEADS_DIR
 
 	manager := &Manager{townRoot: townRoot}
-	if err := manager.initAgentBeads(rigPath, "demo", "gt", false); err != nil {
+	if err := manager.initAgentBeads(rigPath, "demo", "gt"); err != nil {
 		t.Fatalf("initAgentBeads: %v", err)
+	}
+
+	// Verify the expected rig-level agents were created
+	data, err := os.ReadFile(agentLog)
+	if err != nil {
+		t.Fatalf("reading agent log: %v", err)
+	}
+	createdAgents = strings.Split(strings.TrimSpace(string(data)), "\n")
+
+	// Should create witness and refinery for the rig
+	expectedAgents := map[string]bool{
+		"gt-demo-witness":  false,
+		"gt-demo-refinery": false,
+	}
+
+	for _, id := range createdAgents {
+		if _, ok := expectedAgents[id]; ok {
+			expectedAgents[id] = true
+		}
+	}
+
+	for id, found := range expectedAgents {
+		if !found {
+			t.Errorf("expected agent %s was not created", id)
+		}
+	}
+	assertBeadsDirLog(t, beadsDirLog, rigBeadsDir)
+}
+
+func TestIsValidBeadsPrefix(t *testing.T) {
+	tests := []struct {
+		prefix string
+		want   bool
+	}{
+		// Valid prefixes
+		{"gt", true},
+		{"bd", true},
+		{"hq", true},
+		{"gastown", true},
+		{"myProject", true},
+		{"my-project", true},
+		{"a", true},
+		{"A", true},
+		{"test123", true},
+		{"a1b2c3", true},
+		{"a-b-c", true},
+
+		// Invalid prefixes
+		{"", false},                      // empty
+		{"1abc", false},                  // starts with number
+		{"-abc", false},                  // starts with hyphen
+		{"abc def", false},               // contains space
+		{"abc;ls", false},                // shell injection attempt
+		{"$(whoami)", false},             // command substitution
+		{"`id`", false},                  // backtick command
+		{"abc|cat", false},               // pipe
+		{"../etc/passwd", false},         // path traversal
+		{"aaaaaaaaaaaaaaaaaaaaa", false}, // too long (21 chars, >20 limit)
+		{"valid-but-with-$var", false},   // variable reference
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.prefix, func(t *testing.T) {
+			got := isValidBeadsPrefix(tt.prefix)
+			if got != tt.want {
+				t.Errorf("isValidBeadsPrefix(%q) = %v, want %v", tt.prefix, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInitBeadsRejectsInvalidPrefix(t *testing.T) {
+	rigPath := t.TempDir()
+	manager := &Manager{}
+
+	tests := []string{
+		"",
+		"$(whoami)",
+		"abc;rm -rf /",
+		"../etc",
+		"123",
+	}
+
+	for _, prefix := range tests {
+		t.Run(prefix, func(t *testing.T) {
+			err := manager.initBeads(rigPath, prefix)
+			if err == nil {
+				t.Errorf("initBeads(%q) should have failed", prefix)
+			}
+			if !strings.Contains(err.Error(), "invalid beads prefix") {
+				t.Errorf("initBeads(%q) error = %q, want error containing 'invalid beads prefix'", prefix, err.Error())
+			}
+		})
+	}
+}
+
+func TestDeriveBeadsPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		// Compound words with common suffixes should split
+		{"gastown", "gt"},       // gas + town
+		{"nashville", "nv"},     // nash + ville
+		{"bridgeport", "bp"},    // bridge + port
+		{"someplace", "sp"},     // some + place
+		{"greenland", "gl"},     // green + land
+		{"springfield", "sf"},   // spring + field
+		{"hollywood", "hw"},     // holly + wood
+		{"oxford", "of"},        // ox + ford
+
+		// Hyphenated names
+		{"my-project", "mp"},
+		{"gas-town", "gt"},
+		{"some-long-name", "sln"},
+
+		// Underscored names
+		{"my_project", "mp"},
+
+		// Short single words (use the whole name)
+		{"foo", "foo"},
+		{"bar", "bar"},
+		{"ab", "ab"},
+
+		// Longer single words without known suffixes (first 2 chars)
+		{"myrig", "my"},
+		{"awesome", "aw"},
+		{"coolrig", "co"},
+
+		// With language suffixes stripped
+		{"myproject-py", "my"},
+		{"myproject-go", "my"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deriveBeadsPrefix(tt.name)
+			if got != tt.want {
+				t.Errorf("deriveBeadsPrefix(%q) = %q, want %q", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSplitCompoundWord(t *testing.T) {
+	tests := []struct {
+		word string
+		want []string
+	}{
+		// Known suffixes
+		{"gastown", []string{"gas", "town"}},
+		{"nashville", []string{"nash", "ville"}},
+		{"bridgeport", []string{"bridge", "port"}},
+		{"someplace", []string{"some", "place"}},
+		{"greenland", []string{"green", "land"}},
+		{"springfield", []string{"spring", "field"}},
+		{"hollywood", []string{"holly", "wood"}},
+		{"oxford", []string{"ox", "ford"}},
+
+		// Just the suffix (should not split)
+		{"town", []string{"town"}},
+		{"ville", []string{"ville"}},
+
+		// No known suffix
+		{"myrig", []string{"myrig"}},
+		{"awesome", []string{"awesome"}},
+
+		// Empty prefix would result (should not split)
+		// Note: "town" itself shouldn't split to ["", "town"]
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.word, func(t *testing.T) {
+			got := splitCompoundWord(tt.word)
+			if len(got) != len(tt.want) {
+				t.Errorf("splitCompoundWord(%q) = %v, want %v", tt.word, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("splitCompoundWord(%q)[%d] = %q, want %q", tt.word, i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }
