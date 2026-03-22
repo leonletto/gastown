@@ -274,6 +274,7 @@ func runTelegramRun(cmd *cobra.Command, args []string) error {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigCh
+		signal.Reset(syscall.SIGTERM, syscall.SIGINT) // restore default so second signal kills immediately
 		fmt.Println("\nShutting down Telegram bridge...")
 		cancel()
 	}()

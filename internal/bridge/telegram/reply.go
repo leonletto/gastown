@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -25,65 +26,107 @@ type InboxReader interface {
 	MarkRead(ctx context.Context, id string) error
 }
 
-// CLIInboxReader reads the overseer inbox by shelling out to gt mail.
+// CLIInboxReader reads the overseer inbox via bd list.
+//
+// The mail system auto-closes and acks messages to "overseer" within seconds,
+// so we can't rely on gt mail inbox --unread. Instead we query bd list directly
+// for all messages (open or closed) assigned to overseer with the gt:message
+// label, and track which IDs we've already forwarded to avoid duplicates.
 type CLIInboxReader struct {
-	townRoot string
+	townRoot  string
+	forwarded map[string]bool // IDs already forwarded to Telegram
 }
 
 // NewCLIInboxReader creates a CLIInboxReader rooted at townRoot.
 func NewCLIInboxReader(townRoot string) *CLIInboxReader {
-	return &CLIInboxReader{townRoot: townRoot}
+	return &CLIInboxReader{
+		townRoot:  townRoot,
+		forwarded: make(map[string]bool),
+	}
 }
 
-// gtMailMessage is the JSON structure returned by `gt mail inbox --json`.
-type gtMailMessage struct {
-	ID       string `json:"id"`
-	From     string `json:"from"`
-	Subject  string `json:"subject"`
-	Body     string `json:"body"`
-	ThreadID string `json:"thread_id"`
+// bdIssue is the JSON structure returned by `bd list --json`.
+type bdIssue struct {
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Assignee    string   `json:"assignee"`
+	Labels      []string `json:"labels"`
 }
 
-// UnreadMessages runs `gt mail inbox --identity overseer --json --unread`
-// and returns parsed messages.
+// UnreadMessages queries bd list for messages assigned to overseer that
+// haven't been forwarded yet. Catches both open and recently-closed messages.
 func (r *CLIInboxReader) UnreadMessages(ctx context.Context) ([]InboxMessage, error) {
-	cmd := exec.CommandContext(ctx, "gt", "mail", "inbox", "--identity", "overseer", "--json", "--unread")
+	cmd := exec.CommandContext(ctx, "bd", "list",
+		"--assignee", "overseer",
+		"--label", "gt:message",
+		"--all",           // include closed
+		"--include-infra", // messages are infra beads
+		"--json",
+		"--no-pager",
+	)
 	cmd.Dir = r.townRoot
 	cmd.Env = append(os.Environ(), "BD_ACTOR=overseer")
 
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("gt mail inbox: %w", err)
+		// bd list returns exit 0 even with no results, but just in case
+		return nil, fmt.Errorf("bd list: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, nil
 	}
 
-	var raw []gtMailMessage
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, fmt.Errorf("gt mail inbox: parse JSON: %w", err)
+	var issues []bdIssue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("bd list: parse JSON: %w", err)
 	}
 
-	msgs := make([]InboxMessage, 0, len(raw))
-	for _, m := range raw {
+	var msgs []InboxMessage
+	for _, iss := range issues {
+		// Skip already-forwarded messages
+		if r.forwarded[iss.ID] {
+			continue
+		}
+
+		// Extract from and thread from labels
+		from, threadID := "", ""
+		for _, l := range iss.Labels {
+			if strings.HasPrefix(l, "from:") {
+				from = l[5:]
+			}
+			if strings.HasPrefix(l, "thread:") {
+				threadID = l[7:]
+			}
+		}
+
+		// Skip messages FROM overseer (those are our outbound, not replies to us)
+		if from == "overseer" {
+			r.forwarded[iss.ID] = true
+			continue
+		}
+
 		msgs = append(msgs, InboxMessage{
-			ID:       m.ID,
-			From:     m.From,
-			Subject:  m.Subject,
-			Body:     m.Body,
-			ThreadID: m.ThreadID,
+			ID:       iss.ID,
+			From:     from,
+			Subject:  iss.Title,
+			Body:     iss.Description,
+			ThreadID: threadID,
 		})
 	}
+
+	// Cap forwarded map to prevent unbounded growth
+	if len(r.forwarded) > 10000 {
+		r.forwarded = make(map[string]bool)
+	}
+
 	return msgs, nil
 }
 
-// MarkRead runs `bd close <id>` to mark a message as read.
-func (r *CLIInboxReader) MarkRead(ctx context.Context, id string) error {
-	cmd := exec.CommandContext(ctx, "bd", "close", id)
-	cmd.Dir = r.townRoot
-	cmd.Env = append(os.Environ(), "BD_ACTOR=overseer")
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("bd close %s: %w: %s", id, err, out)
-	}
+// MarkRead records the message as forwarded. The mail system already auto-closes
+// messages to overseer, so we just track the ID to avoid re-forwarding.
+func (r *CLIInboxReader) MarkRead(_ context.Context, id string) error {
+	r.forwarded[id] = true
 	return nil
 }
 

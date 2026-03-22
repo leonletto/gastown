@@ -69,6 +69,18 @@ func (b *Bridge) Stop() {
 	}
 }
 
+// safeGo runs fn with panic recovery so a panicking goroutine doesn't
+// crash the entire bridge. Panics are logged and the goroutine exits cleanly.
+func safeGo(wg *sync.WaitGroup, name string, fn func()) {
+	defer wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("telegram bridge: PANIC in %s (recovered): %v", name, r)
+		}
+	}()
+	fn()
+}
+
 // runOnce performs a single connection-to-shutdown cycle:
 //  1. Recovers from panics.
 //  2. Connects to Telegram.
@@ -112,22 +124,13 @@ func (b *Bridge) runOnce(ctx context.Context) (retErr error) {
 	var wg sync.WaitGroup
 
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		bot.Poll(runCtx)
-	}()
+	go safeGo(&wg, "bot.Poll", func() { bot.Poll(runCtx) })
 
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		outbound.Run(runCtx)
-	}()
+	go safeGo(&wg, "outbound", func() { outbound.Run(runCtx) })
 
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		replyFwd.Run(runCtx)
-	}()
+	go safeGo(&wg, "replyFwd", func() { replyFwd.Run(runCtx) })
 
 	// Main loop: relay inbound messages until context is cancelled.
 	for {
