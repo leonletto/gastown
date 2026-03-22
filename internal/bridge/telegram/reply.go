@@ -123,6 +123,41 @@ func (r *CLIInboxReader) UnreadMessages(ctx context.Context) ([]InboxMessage, er
 	return msgs, nil
 }
 
+// SeedForwarded queries all existing messages and marks them as already-forwarded.
+// Call this once at startup so that only messages arriving after the bridge starts
+// get forwarded to Telegram.
+func (r *CLIInboxReader) SeedForwarded(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "bd", "list",
+		"--assignee", "overseer",
+		"--label", "gt:message",
+		"--all",
+		"--include-infra",
+		"--json",
+		"--no-pager",
+	)
+	cmd.Dir = r.townRoot
+	cmd.Env = append(os.Environ(), "BD_ACTOR=overseer")
+
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("seed forwarded: bd list: %w", err)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+
+	var issues []bdIssue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return fmt.Errorf("seed forwarded: parse JSON: %w", err)
+	}
+
+	for _, iss := range issues {
+		r.forwarded[iss.ID] = true
+	}
+	log.Printf("reply forwarder: seeded %d existing messages as already-forwarded", len(issues))
+	return nil
+}
+
 // MarkRead records the message as forwarded. The mail system already auto-closes
 // messages to overseer, so we just track the ID to avoid re-forwarding.
 func (r *CLIInboxReader) MarkRead(_ context.Context, id string) error {

@@ -17,6 +17,7 @@ type Bridge struct {
 	sender      Sender
 	townRoot    string
 	inboxReader InboxReader // Optional: injected by daemon, nil = use CLIInboxReader
+	msgMap      *MessageMap // persists across reconnects to avoid duplicate sends
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -32,6 +33,7 @@ func NewBridge(cfg Config, sender Sender, townRoot string) *Bridge {
 		cfg:      cfg,
 		sender:   sender,
 		townRoot: townRoot,
+		msgMap:   NewMessageMap(10000),
 	}
 }
 
@@ -106,20 +108,23 @@ func (b *Bridge) runOnce(ctx context.Context) (retErr error) {
 		return fmt.Errorf("telegram bridge: connect: %w", err)
 	}
 
-	msgMap := NewMessageMap(10000)
-	inbound := NewInboundRelay(b.sender, msgMap, b.cfg.Target)
+	inbound := NewInboundRelay(b.sender, b.msgMap, b.cfg.Target)
 
 	feedPath := filepath.Join(b.townRoot, ".feed.jsonl")
-	outbound := NewOutboundNotifier(feedPath, b.cfg.Notify, bot, msgMap)
+	outbound := NewOutboundNotifier(feedPath, b.cfg.Notify, bot, b.msgMap)
 
-	var inboxReader InboxReader
-	if b.inboxReader != nil {
-		inboxReader = b.inboxReader
-	} else {
-		inboxReader = NewCLIInboxReader(b.townRoot)
+	b.mu.Lock()
+	if b.inboxReader == nil {
+		cliReader := NewCLIInboxReader(b.townRoot)
+		if err := cliReader.SeedForwarded(runCtx); err != nil {
+			log.Printf("telegram bridge: seed forwarded (non-fatal): %v", err)
+		}
+		b.inboxReader = cliReader
 	}
+	inboxReader := b.inboxReader
+	b.mu.Unlock()
 
-	replyFwd := NewReplyForwarder(bot, inboxReader, msgMap)
+	replyFwd := NewReplyForwarder(bot, inboxReader, b.msgMap)
 
 	var wg sync.WaitGroup
 
